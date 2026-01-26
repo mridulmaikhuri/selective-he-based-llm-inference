@@ -1,0 +1,97 @@
+# =====================
+# Python
+# =====================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =====================
+# Virtual environments
+# =====================
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# =====================
+# Jupyter / IPython
+# =====================
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# =====================
+# PyTorch / ML artifacts
+# =====================
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+models/
+
+# =====================
+# Datasets (usually large)
+# =====================
+data/
+datasets/
+
+# =====================
+# Logs / experiment outputs
+# =====================
+logs/
+runs/
+wandb/
+tensorboard/
+*.log
+
+# =====================
+# Results / plots
+# =====================
+results/
+figures/
+plots/
+*.csv
+*.json
+
+# =====================
+# Build / distribution
+# =====================
+build/
+dist/
+*.egg-info/
+
+# =====================
+# IDEs / editors
+# =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =====================
+# OS files
+# =====================
+.DS_Store
+Thumbs.db
+
+# =====================
+# pytest / coverage
+# =====================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =====================
+# mypy / type checking
+# =====================
+.mypy_cache/
+
+# =====================
+# Secrets / configs
+# =====================
+.env
+.env.*
+config_local.yaml
+secrets.yaml
+
