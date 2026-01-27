@@ -1,0 +1,10 @@
+torch
+Pyfhel
+datasets
+transformers
+matplotlib
+pandas
+tqdm
+numpy
+rich
+pytest

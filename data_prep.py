@@ -11,7 +11,14 @@ def download_dataset(max_retries=3):
     for attempt in range(max_retries):
         try:
             print(f"Downloading Tiny Shakespeare dataset (attempt {attempt + 1}/{max_retries})...")
-            dataset = load_dataset("tiny_shakespeare")
+            import urllib.request
+            url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+            print(f"Downloading from {url}...")
+            
+            with urllib.request.urlopen(url) as response:
+                text = response.read().decode('utf-8')
+            
+            dataset = {"train": {"text": [text]}}
             print("✓ Dataset downloaded successfully")
             return dataset
         except Exception as e:
@@ -163,43 +170,25 @@ def prepare_data(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Prepare Tiny Shakespeare dataset for GPT-2 training",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Prepare full dataset
-  python data_prep.py --out-dir data/
-
-  # Quick test with limited sequences
-  python data_prep.py --out-dir data/ --max-seqs 100
-
-  # Custom sequence length
-  python data_prep.py --out-dir data/ --seq-len 512
-        """
-    )
-    
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--out-dir",
         type=str,
         default="data",
         help="Output directory for saved files (default: data)"
     )
-    
     parser.add_argument(
         "--seq-len",
         type=int,
         default=256,
         help="Sequence length for chunking (default: 256)"
     )
-    
     parser.add_argument(
         "--max-seqs",
         type=int,
         default=None,
         help="Maximum number of sequences to generate (for testing, default: None = all)"
     )
-    
     args = parser.parse_args()
     
     # Validate arguments
