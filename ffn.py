@@ -199,8 +199,6 @@ if __name__ == "__main__":
     difference = torch.abs(output1 - output2).mean().item()
     print(f"Mean absolute difference between two forward passes: {difference:.6f}")
     
-    # Note: There's a small chance they could be the same by random chance,
-    # but with seq_len=10 and dropout=0.1, this is extremely unlikely
     if difference > 1e-6:
         print("✓ Train mode works correctly (stochastic output due to dropout)!")
     else:
