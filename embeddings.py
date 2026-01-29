@@ -55,7 +55,7 @@ class TokenPositionalEmbedding(nn.Module):
             torch.Tensor: Positional encoding tensor of shape (1, max_len, d_model)
         """
         # Create position indices [0, 1, 2, ..., max_len-1]
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # (max_len, 1)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1) 
         
         # Create dimension indices [0, 2, 4, ..., d_model-2]
         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * 
