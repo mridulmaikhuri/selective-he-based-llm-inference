@@ -189,26 +189,41 @@ class SelectiveHEConfig:
 # EXAMPLE CONFIGURATIONS FOR STRATEGIES 1-3
 # ============================================================================
 
-# STRATEGY 1: Encrypt only attention outputs (minimal overhead)
+# NOTE: Layer names must match the actual model's named_modules() output
+# For TinyGPT model, the structure is:
+#   - blocks.0, blocks.1, ... (transformer blocks)
+#   - blocks.{i}.attention (attention sub-layer)
+#   - blocks.{i}.ffn (feed-forward sub-layer)
+#   - blocks.{i}.ln1, blocks.{i}.ln2 (layer norms)
+#   - lm_head (language modeling head)
+#   - embedding, ln_f (embedding and final layer norm)
+#
+# To find valid layer names for YOUR model, run:
+#   for name, _ in model.named_modules():
+#       print(name)
+
+# STRATEGY 1: Encrypt only first block's attention (minimal overhead)
 STRATEGY_1_CONFIG = {
-    "layers_to_encrypt": ["attention_output"],
+    "layers_to_encrypt": ["blocks.0.attention"],
     "operations_to_encrypt": {},
     "encryption_granularity": "layer"
 }
 
-# STRATEGY 2: Encrypt attention and FFN outputs (balanced)
+# STRATEGY 2: Encrypt attention and FFN in first two blocks (balanced)
 STRATEGY_2_CONFIG = {
-    "layers_to_encrypt": ["attention_output", "ffn_output"],
+    "layers_to_encrypt": ["blocks.0.attention", "blocks.0.ffn", "blocks.1.attention", "blocks.1.ffn"],
     "operations_to_encrypt": {},
     "encryption_granularity": "layer"
 }
 
-# STRATEGY 3: Encrypt all sensitive operations (maximum security, high overhead)
+# STRATEGY 3: Encrypt all blocks and language modeling head (maximum security, high overhead)
 STRATEGY_3_CONFIG = {
-    "layers_to_encrypt": ["attention_output", "ffn_output", "lm_head"],
+    "layers_to_encrypt": ["blocks.0.attention", "blocks.0.ffn", "blocks.1.attention", "blocks.1.ffn", "lm_head"],
     "operations_to_encrypt": {
-        "attention_output": ["matmul", "softmax"],
-        "ffn_output": ["matmul", "gelu"],
+        "blocks.0.attention": ["matmul", "softmax"],
+        "blocks.0.ffn": ["matmul", "gelu"],
+        "blocks.1.attention": ["matmul", "softmax"],
+        "blocks.1.ffn": ["matmul", "gelu"],
         "lm_head": ["matmul"]
     },
     "encryption_granularity": "operation"
