@@ -30,6 +30,7 @@ ipython_config.py
 *.ckpt
 checkpoints/
 models/
+*.csv
 
 # =====================
 # Datasets (usually large)
