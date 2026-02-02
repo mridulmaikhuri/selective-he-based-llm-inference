@@ -29,7 +29,7 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, cast
 from dataclasses import dataclass, asdict
 import numpy as np
 from tqdm import tqdm
@@ -358,20 +358,20 @@ def run_experiment(
         previous_data = load_partial_results(resume_from_path)
         if isinstance(previous_data, list):
             for item in previous_data:
-                item_dict = item if isinstance(item, dict) else {}
-                run_key = (item_dict.get('method'), item_dict.get('prompt_id'), item_dict.get('prompt_length'))
-                completed_runs.add(run_key)
+                if isinstance(item, dict):
+                    run_key = (item.get('method'), item.get('prompt_id'), item.get('prompt_length'))
+                    completed_runs.add(run_key)
             results = [
                 ExperimentResult(
-                    method=item['method'],
-                    prompt_length=int(item['prompt_length']),
-                    prompt_id=int(item['prompt_id']),
-                    avg_latency_ms=float(item['avg_latency_ms']),
-                    tokens_per_sec=float(item['tokens_per_sec']),
-                    perplexity=float(item['perplexity']),
-                    peak_ram_mb=float(item['peak_ram_mb']),
-                    peak_vram_mb=float(item['peak_vram_mb']),
-                    ciphertext_overhead_mb=float(item['ciphertext_overhead_mb']),
+                    method=cast(str, item.get('method')),
+                    prompt_length=int(item.get('prompt_length', 0)),
+                    prompt_id=int(item.get('prompt_id', 0)),
+                    avg_latency_ms=float(item.get('avg_latency_ms', 0.0)),
+                    tokens_per_sec=float(item.get('tokens_per_sec', 0.0)),
+                    perplexity=float(item.get('perplexity', 0.0)),
+                    peak_ram_mb=float(item.get('peak_ram_mb', 0.0)),
+                    peak_vram_mb=float(item.get('peak_vram_mb', 0.0)),
+                    ciphertext_overhead_mb=float(item.get('ciphertext_overhead_mb', 0.0)),
                     error=item.get('error'),
                     timestamp=item.get('timestamp', '')
                 )
