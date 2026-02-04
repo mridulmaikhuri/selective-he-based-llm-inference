@@ -8,3 +8,4 @@ tqdm
 numpy
 rich
 pytest
+psutil
