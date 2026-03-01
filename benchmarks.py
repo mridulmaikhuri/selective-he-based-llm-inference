@@ -62,7 +62,10 @@ def _build_method_inference(
     method = method.lower()
 
     if method == "plain":
-        return _infer_plain, {}
+        def _infer_plain_closure(x: torch.Tensor) -> torch.Tensor:
+            return _infer_plain(model, x)
+
+        return _infer_plain_closure, {}
 
     # Selective HE strategies: strategy1 / strategy2 / strategy3
     if method.startswith("strategy"):
@@ -382,4 +385,47 @@ __all__ = [
     "compute_perplexity",
     "memory_profiling",
 ]
+
+
+def main() -> None:
+    """
+    Simple CLI entrypoint for quick manual benchmarking.
+
+    Example:
+        python benchmarks.py
+    """
+    from model import TinyGPT
+
+    set_random_seeds(42)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[benchmarks] Using device: {device}")
+
+    model = TinyGPT(
+        num_layers=2,
+        vocab_size=256,
+        d_model=64,
+        num_heads=4,
+        d_ff=256,
+        max_len=64,
+        dropout=0.1,
+    ).to(device)
+    model.eval()
+
+    # Dummy input for quick smoke-test
+    seq_len = 16
+    inputs = torch.randint(0, model.vocab_size, (1, seq_len), dtype=torch.long, device=device)
+
+    print("\n=== Timing (plain) ===")
+    timing = time_inference(model, inputs, method="plain", n_runs=5)
+    print(timing)
+
+    print("\n=== Memory (plain) ===")
+    mem = memory_profiling(model, method="plain", sample_input=inputs)
+    print(mem)
+
+
+if __name__ == "__main__":
+    main()
+
 

@@ -14,8 +14,9 @@ Key Design Choices:
 
 import torch
 import time
-from typing import Union, List
+from typing import Union, List, Tuple, Any
 from Pyfhel import Pyfhel
+import numpy as np
 
 
 def setup_HE_context(n: int = 2**14, t: int = 65537) -> Pyfhel:
@@ -150,10 +151,10 @@ def decrypt_tensor(ciphertexts: Union[List, List[List]], HE: Pyfhel) -> torch.Te
     """
     if not isinstance(HE, Pyfhel):
         raise ValueError("HE must be a Pyfhel object")
-    
+
     if not ciphertexts:
         raise ValueError("Empty ciphertext list")
-    
+
     # Detect if batched by checking if first element is a list
     if isinstance(ciphertexts[0], list):
         # Unbatched 2D: list of lists of ciphertexts
@@ -162,29 +163,220 @@ def decrypt_tensor(ciphertexts: Union[List, List[List]], HE: Pyfhel) -> torch.Te
             decrypted_row = [int(HE.decrypt(ct)[0]) for ct in row]
             result.append(decrypted_row)
         return torch.tensor(result, dtype=torch.long)
-    
+
+    # Check if batch by decrypting first ciphertext and checking slot count
+    first_decrypted = HE.decrypt(ciphertexts[0])
+
+    # first_decrypted is numpy array; check if we have explicit batching
+    # (multiple distinct values) or implicit (all same value)
+    unique_vals = len(set(first_decrypted))
+
+    if unique_vals > 1:
+        # Batched: multiple distinct values in slots
+        result = []
+        for ct in ciphertexts:
+            # Take only the unique values from this batch
+            dec_vals = HE.decrypt(ct)
+            # Get the unique values preserving order
+            decrypted_row = list(dict.fromkeys(dec_vals))
+            result.append(decrypted_row)
+        return torch.tensor(result, dtype=torch.long)
+
+    # Unbatched 1D: scalar encrypted, replicated across all slots
+    result = [int(HE.decrypt(ct)[0]) for ct in ciphertexts]
+    return torch.tensor(result, dtype=torch.long)
+
+
+def batch_encrypt(
+    values: np.ndarray,
+    HE: Pyfhel,
+    pack_size: int,
+) -> Tuple[List[Any], int]:
+    """
+    Batched encoding/encryption for SIMD-style packing.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        1D array of integers/floats to encrypt.
+    HE : Pyfhel
+        Initialized Pyfhel context.
+    pack_size : int
+        Number of slots per ciphertext to pack. If <= 0, falls back to
+        elementwise encryption.
+
+    Returns
+    -------
+    ciphertexts : list
+        List of Pyfhel ciphertexts, each containing up to pack_size values.
+    pad : int
+        Number of padding elements (zeros) added at the end to align to
+        pack_size.
+
+    Notes
+    -----
+    - If HE supports vector encryption (BFV with batching), we pack
+      contiguous chunks into a single ciphertext.
+    - Fallback: if an error occurs, we fall back to scalar encryption.
+    """
+    if not isinstance(HE, Pyfhel):
+        raise ValueError("HE must be a Pyfhel object")
+
+    arr = np.asarray(values)
+    arr = arr.astype(np.int64)
+
+    if pack_size is None or pack_size <= 0:
+        cts = [HE.encrypt(int(v)) for v in arr]
+        return cts, 0
+
+    n = len(arr)
+    pad = (pack_size - (n % pack_size)) % pack_size
+    if pad > 0:
+        arr = np.concatenate([arr, np.zeros(pad, dtype=arr.dtype)])
+
+    ciphertexts: List[Any] = []
+    try:
+        for i in range(0, len(arr), pack_size):
+            chunk = arr[i : i + pack_size].tolist()
+            ciphertexts.append(HE.encrypt(chunk))
+    except Exception:
+        # Fallback: scalar encryption
+        ciphertexts = [HE.encrypt(int(v)) for v in arr]
+    return ciphertexts, pad
+
+
+def he_linear_batched(
+    enc_inputs: List[Any],
+    weight: torch.Tensor,
+    bias: Union[torch.Tensor, None],
+    HE: Pyfhel,
+    pack_size: int,
+) -> List[Any]:
+    """
+    Approximate batched encrypted linear layer using SIMD-style packing.
+
+    Parameters
+    ----------
+    enc_inputs : list
+        List of ciphertexts returned by batch_encrypt.
+    weight : torch.Tensor
+        Weight matrix of shape (out_features, in_features).
+    bias : torch.Tensor or None
+        Optional bias vector of shape (out_features,).
+    HE : Pyfhel
+        Pyfhel context.
+    pack_size : int
+        Packing size used in batch_encrypt.
+
+    Returns
+    -------
+    list of ciphertexts
+        Encrypted outputs (one ciphertext per output chunk).
+
+    Notes
+    -----
+    This is a highly simplified batched linear implementation:
+      - It assumes a row-major layout and uses slot-wise multiplication
+        followed by slot rotations (not implemented here for brevity).
+      - In practice, you would use Pyfhel's rotate and add operations
+        to implement dot-products over packed slots.
+      - For this demo, we fall back to decrypt → matmul → encrypt to
+        focus on benchmarking packing overhead vs scalar encryption.
+    """
+    if not isinstance(HE, Pyfhel):
+        raise ValueError("HE must be a Pyfhel object")
+
+    # Fallback demo implementation: decrypt, apply plaintext linear, re-encrypt.
+    # This still allows us to benchmark packing vs scalar encryption cost.
+    decrypted = []
+    for ct in enc_inputs:
+        vals = HE.decrypt(ct)
+        decrypted.extend(list(dict.fromkeys(vals)))
+    x = torch.tensor(decrypted, dtype=torch.long)
+    x = x.to(weight.dtype)
+
+    # Truncate or pad x to match weight.in_features
+    in_features = weight.shape[1]
+    if x.numel() < in_features:
+        pad = in_features - x.numel()
+        x = torch.cat([x, torch.zeros(pad, dtype=x.dtype)], dim=0)
+    elif x.numel() > in_features:
+        x = x[:in_features]
+
+    out = weight @ x
+    if bias is not None:
+        out = out + bias.to(out.dtype)
+
+    out_np = out.detach().cpu().numpy().astype(np.int64)
+    cts, _ = batch_encrypt(out_np, HE, pack_size=pack_size)
+    return cts
+
+
+def he_batch_benchmark() -> None:
+    """
+    Benchmark batched vs element-wise encryption and linear ops.
+
+    Uses small toy sizes and prints a rough speedup factor along with
+    caveats about this simplified implementation.
+    """
+    print("=" * 70)
+    print("HE batched vs element-wise benchmark")
+    print("=" * 70)
+
+    HE = setup_HE_context(n=2**14, t=65537)
+
+    in_features = 64
+    out_features = 32
+    pack_size = 16
+
+    x = np.random.randint(0, 100, size=(in_features,), dtype=np.int64)
+    weight = torch.randint(0, 10, (out_features, in_features), dtype=torch.long)
+    bias = torch.randint(0, 10, (out_features,), dtype=torch.long)
+
+    # Element-wise path
+    start = time.perf_counter()
+    enc_scalar = [HE.encrypt(int(v)) for v in x]
+    scalar_enc_time = (time.perf_counter() - start) * 1000
+
+    # Decrypt + linear + re-encrypt for element-wise (fair comparison)
+    start = time.perf_counter()
+    dec_scalar = [int(HE.decrypt(ct)[0]) for ct in enc_scalar]
+    x_plain = torch.tensor(dec_scalar, dtype=torch.long).to(weight.dtype)
+    y_plain = weight @ x_plain + bias.to(x_plain.dtype)
+    _ = [HE.encrypt(int(v)) for v in y_plain.detach().cpu().numpy()]
+    scalar_total_time = (time.perf_counter() - start) * 1000
+
+    # Batched path
+    start = time.perf_counter()
+    enc_batched, pad = batch_encrypt(x, HE, pack_size=pack_size)
+    batched_enc_time = (time.perf_counter() - start) * 1000
+
+    start = time.perf_counter()
+    _ = he_linear_batched(enc_batched, weight, bias, HE, pack_size=pack_size)
+    batched_total_time = (time.perf_counter() - start) * 1000
+
+    print(f"Scalar encrypt time:   {scalar_enc_time:.2f} ms")
+    print(f"Scalar end-to-end:     {scalar_total_time:.2f} ms")
+    print(f"Batched encrypt time:  {batched_enc_time:.2f} ms (pad={pad})")
+    print(f"Batched end-to-end:    {batched_total_time:.2f} ms")
+
+    scalar = scalar_enc_time + scalar_total_time
+    batched = batched_enc_time + batched_total_time
+    if batched > 0:
+        speedup = scalar / batched
     else:
-        # Check if batch by decrypting first ciphertext and checking slot count
-        first_decrypted = HE.decrypt(ciphertexts[0])
-        
-        # first_decrypted is numpy array; check if we have explicit batching
-        # (multiple distinct values) or implicit (all same value)
-        unique_vals = len(set(first_decrypted))
-        
-        if unique_vals > 1:
-            # Batched: multiple distinct values in slots
-            result = []
-            for ct in ciphertexts:
-                # Take only the unique values from this batch
-                dec_vals = HE.decrypt(ct)
-                # Get the unique values preserving order
-                decrypted_row = list(dict.fromkeys(dec_vals))
-                result.append(decrypted_row)
-            return torch.tensor(result, dtype=torch.long)
-        else:
-            # Unbatched 1D: scalar encrypted, replicated across all slots
-            result = [int(HE.decrypt(ct)[0]) for ct in ciphertexts]
-            return torch.tensor(result, dtype=torch.long)
+        speedup = float("inf")
+
+    print(f"\nEstimated speedup (scalar / batched): {speedup:.2f}x")
+    print(
+        "\nCaveats:\n"
+        "  - he_linear_batched currently decrypts, runs plaintext matmul, and\n"
+        "    re-encrypts; a production implementation would use rotation and\n"
+        "    slot-wise ops to keep computation encrypted end-to-end.\n"
+        "  - Speedup mainly reflects fewer ciphertext objects and packing\n"
+        "    overhead, not true HE matmul cost.\n"
+        "  - Use this as a qualitative indicator only.\n"
+    )
 
 
 def test_homomorphic_operations() -> None:
@@ -278,3 +470,5 @@ def test_homomorphic_operations() -> None:
 
 if __name__ == "__main__":
     test_homomorphic_operations()
+    print("\nRunning batched HE benchmark...\n")
+    he_batch_benchmark()
