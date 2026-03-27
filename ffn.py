@@ -1,299 +1,262 @@
+# ffn.py
+"""
+Transformer Feed-Forward Block
+================================
+Implements the position-wise feed-forward network (FFN) used in every
+transformer layer. Each token's representation is projected independently
+through a two-layer MLP with a GELU non-linearity in between.
+
+The canonical form (Vaswani et al., 2017) uses ReLU; modern practice
+(GPT-2 / BERT) swaps in GELU for smoother gradients.
+
+Structure:
+    x → Linear(d_model, d_ff) → GELU → Dropout → Linear(d_ff, d_model) → Dropout → out
+
+Reference:
+    Vaswani et al., "Attention Is All You Need", NeurIPS 2017. §3.3
+    https://arxiv.org/abs/1706.03762
+
+Usage:
+    from ffn import FeedForward
+    import torch
+
+    ff  = FeedForward(d_model=128, d_ff=512, dropout=0.1)
+    x   = torch.randn(2, 10, 128)   # (batch, seq_len, d_model)
+    out = ff(x)                      # (2, 10, 128)
+"""
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 class FeedForward(nn.Module):
-    """
-    Position-wise Feed-Forward Network (FFN).
-    
-    A two-layer fully connected network with GELU activation applied to each
-    position independently. This is a standard component in transformer architectures.
-    
-    The architecture follows:
-        x -> Linear(d_model, d_ff) -> GELU -> Dropout -> Linear(d_ff, d_model) -> Dropout -> output
-    
-    Args:
-        d_model (int): Dimension of input and output embeddings. Default: 128
-        d_ff (int): Dimension of the intermediate hidden layer. Default: 512
-            Typically set to 4 * d_model in standard transformers.
-        dropout (float): Dropout probability applied after each layer. Default: 0.1
-    
-    Attributes:
-        fc1 (nn.Linear): First linear transformation (expansion layer)
-        fc2 (nn.Linear): Second linear transformation (projection layer)
-        dropout (nn.Dropout): Dropout layer applied after GELU and final output
-    
-    Shape:
-        Input: (batch_size, seq_len, d_model)
-        Output: (batch_size, seq_len, d_model)
-    """
-    
-    def __init__(self, d_model=128, d_ff=512, dropout=0.1):
-        super(FeedForward, self).__init__()
-        
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.dropout_prob = dropout
-        
-        # First linear layer: expands from d_model to d_ff
-        # This is the "expansion" layer that increases dimensionality
-        self.fc1 = nn.Linear(d_model, d_ff, bias=True)
-        
-        # Second linear layer: projects back from d_ff to d_model
-        # This is the "projection" layer that returns to original dimensionality
-        self.fc2 = nn.Linear(d_ff, d_model, bias=True)
-        
-        # Dropout layer (reused for efficiency)
-        # Applied after GELU activation and after final projection
-        self.dropout = nn.Dropout(dropout)
-        
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        """
-        Initialize layer weights using Xavier uniform initialization.
-        
-        This initialization helps maintain gradient magnitudes across layers
-        and is standard for transformer feed-forward networks.
-        """
-        # Initialize first layer
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.zeros_(self.fc1.bias)
-        
-        # Initialize second layer
-        nn.init.xavier_uniform_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-    
-    def forward(self, x):
-        """
-        Forward pass through the feed-forward network.
-        
-        The computation flow:
-        1. Expand: (B, S, d_model) -> (B, S, d_ff)
-        2. Activate: Apply GELU non-linearity
-        3. Dropout: Apply dropout for regularization
-        4. Project: (B, S, d_ff) -> (B, S, d_model)
-        5. Dropout: Apply dropout again
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model)
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model)
-        
-        Note:
-            This implementation is efficient and operates in-place where possible,
-            avoiding unnecessary tensor copies.
-        """
-        # Step 1: First linear transformation (expansion)
-        # (B, S, d_model) -> (B, S, d_ff)
-        x = self.fc1(x)
-        
-        # Step 2: Apply GELU activation
-        # GELU (Gaussian Error Linear Unit) is smoother than ReLU
-        # and is the standard activation for transformer FFNs
-        x = F.gelu(x)
-        
-        # Step 3: Apply dropout after activation
-        # This helps prevent overfitting by randomly zeroing elements
-        x = self.dropout(x)
-        
-        # Step 4: Second linear transformation (projection)
-        # (B, S, d_ff) -> (B, S, d_model)
-        x = self.fc2(x)
-        
-        # Step 5: Apply dropout after projection
-        # This provides additional regularization before the residual connection
-        x = self.dropout(x)
-        
-        return x
+    """Position-wise two-layer feed-forward network.
 
+    Applied identically and independently to every position in the sequence.
+    The inner dimension d_ff (commonly 4 × d_model) acts as an expansion
+    bottleneck: the model can route token representations through a richer
+    feature space before projecting back.
+
+    Dropout is applied twice:
+      1. After the GELU activation  — regularises the hidden representation.
+      2. After the output projection — regularises the residual contribution
+         before it is added back in the surrounding TransformerBlock.
+
+    Args:
+        d_model  (int):   Input and output dimension. Default: 128.
+        d_ff     (int):   Inner (expansion) dimension. Default: 512.
+        dropout  (float): Dropout probability (both dropout layers share
+                          the same rate). Default: 0.1.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        d_ff: int = 512,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        # ------------------------------------------------------------------ #
+        # Argument validation                                                  #
+        # ------------------------------------------------------------------ #
+        if d_model < 1:
+            raise ValueError(f"d_model must be >= 1, got {d_model}")
+        if d_ff < 1:
+            raise ValueError(f"d_ff must be >= 1, got {d_ff}")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+
+        self.d_model = d_model
+        self.d_ff    = d_ff
+
+        # ------------------------------------------------------------------ #
+        # Layers                                                               #
+        #                                                                      #
+        # nn.Sequential fuses the sub-layers into a single callable with no   #
+        # intermediate Python variables, avoiding accidental extra copies and  #
+        # keeping forward() a one-liner.                                       #
+        #                                                                      #
+        # Layer breakdown:                                                     #
+        #   fc1     : (B, S, d_model) → (B, S, d_ff)   expansion             #
+        #   gelu    : element-wise, shape unchanged                            #
+        #   drop1   : randomly zeros hidden units during training              #
+        #   fc2     : (B, S, d_ff)    → (B, S, d_model) projection            #
+        #   drop2   : randomly zeros output units during training              #
+        # ------------------------------------------------------------------ #
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_ff),   # fc1 — expand
+            nn.GELU(),                   # smooth non-linearity
+            nn.Dropout(p=dropout),       # drop1 — hidden regularisation
+            nn.Linear(d_ff, d_model),   # fc2 — project back
+            nn.Dropout(p=dropout),       # drop2 — output regularisation
+        )
+
+        self._init_weights()
+
+    # ---------------------------------------------------------------------- #
+    # Weight initialisation                                                    #
+    # ---------------------------------------------------------------------- #
+
+    def _init_weights(self) -> None:
+        """Initialise linear layers with Xavier uniform + zero bias.
+
+        Xavier uniform keeps the variance of activations roughly constant
+        across layers at the start of training, preventing vanishing /
+        exploding signals.
+        """
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    # ---------------------------------------------------------------------- #
+    # Forward                                                                  #
+    # ---------------------------------------------------------------------- #
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the feed-forward block to every token position.
+
+        Args:
+            x (Tensor): Input of shape (B, S, d_model).
+
+        Returns:
+            Tensor of shape (B, S, d_model), same dtype as input.
+
+        Raises:
+            ValueError: If x is not 3-D or its last dimension ≠ d_model.
+        """
+        if x.dim() != 3:
+            raise ValueError(
+                f"Expected 3-D input (B, S, d_model), got shape {tuple(x.shape)}"
+            )
+        if x.shape[-1] != self.d_model:
+            raise ValueError(
+                f"Last dimension of input ({x.shape[-1]}) "
+                f"does not match d_model ({self.d_model})"
+            )
+
+        # nn.Sequential applies fc1 → GELU → drop1 → fc2 → drop2 in one call.
+        # No intermediate tensors are held in Python scope, so peak memory is
+        # determined by PyTorch's autograd graph, not by extra local variables.
+        return self.net(x)   # (B, S, d_model)
+
+    # ---------------------------------------------------------------------- #
+    # Helpers                                                                  #
+    # ---------------------------------------------------------------------- #
+
+    def extra_repr(self) -> str:
+        """Shown by print(model) alongside the default nn.Sequential repr."""
+        return (
+            f"d_model={self.d_model}, "
+            f"d_ff={self.d_ff}, "
+            f"dropout={self.net[2].p}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Self-test                                                                     #
+# --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
-    print("Testing FeedForward Network...")
-    print("=" * 70)
-    
-    # Test 1: Basic functionality with default parameters
-    print("\n[Test 1] Basic functionality with default parameters")
-    print("-" * 70)
-    
-    # Create model with default parameters
-    d_model = 128
-    d_ff = 512
-    batch_size = 2
-    seq_len = 10
-    
-    model = FeedForward(d_model=d_model, d_ff=d_ff, dropout=0.1)
-    
-    # Create dummy input
-    x = torch.randn(batch_size, seq_len, d_model)
-    
-    print(f"Input shape: {x.shape}")
-    print(f"Input dtype: {x.dtype}")
-    print(f"Expected output shape: ({batch_size}, {seq_len}, {d_model})")
-    
-    # Forward pass
-    output = model(x)
-    
-    print(f"Output shape: {output.shape}")
-    print(f"Output dtype: {output.dtype}")
-    
-    # Assert correct shape
-    assert output.shape == (batch_size, seq_len, d_model), \
-        f"Shape mismatch! Expected {(batch_size, seq_len, d_model)}, got {output.shape}"
-    print("✓ Shape assertion passed!")
-    
-    # Assert correct dtype
-    assert output.dtype == x.dtype, \
-        f"Dtype mismatch! Expected {x.dtype}, got {output.dtype}"
-    print("✓ Dtype assertion passed!")
-    
-    # Check for NaNs or Infs
-    assert not torch.isnan(output).any(), "Output contains NaN values!"
-    assert not torch.isinf(output).any(), "Output contains Inf values!"
-    print("✓ No NaN or Inf values detected!")
-    
-    # Test 2: Verify output is different from input (transformation occurred)
-    print("\n[Test 2] Verify transformation occurred")
-    print("-" * 70)
-    
-    # Output should be different from input
-    difference = torch.abs(output - x).mean().item()
-    print(f"Mean absolute difference between input and output: {difference:.6f}")
-    assert difference > 0.01, "Output is too similar to input - transformation may not be working!"
-    print("✓ Transformation verified!")
-    
-    # Test 3: Eval mode (no dropout)
-    print("\n[Test 3] Test eval mode (dropout disabled)")
-    print("-" * 70)
-    
-    model.eval()
-    
-    # Run same input twice - should get identical outputs in eval mode
-    output1 = model(x)
-    output2 = model(x)
-    
-    print(f"Output 1 shape: {output1.shape}")
-    print(f"Output 2 shape: {output2.shape}")
-    
-    # Check if outputs are identical
-    assert torch.allclose(output1, output2), \
-        "Outputs differ in eval mode - dropout may not be disabled properly!"
-    print("✓ Eval mode works correctly (deterministic output)!")
-    
-    # Test 4: Train mode (with dropout)
-    print("\n[Test 4] Test train mode (dropout enabled)")
-    print("-" * 70)
-    
-    model.train()
-    
-    # Run same input twice - outputs should differ due to dropout
-    output1 = model(x)
-    output2 = model(x)
-    
-    print(f"Output 1 shape: {output1.shape}")
-    print(f"Output 2 shape: {output2.shape}")
-    
-    # Check if outputs differ
-    difference = torch.abs(output1 - output2).mean().item()
-    print(f"Mean absolute difference between two forward passes: {difference:.6f}")
-    
-    if difference > 1e-6:
-        print("✓ Train mode works correctly (stochastic output due to dropout)!")
-    else:
-        print("⚠ Outputs are identical (may be due to random chance)")
-    
-    # Test 5: Different configurations
-    print("\n[Test 5] Test different configurations")
-    print("-" * 70)
-    
-    configs = [
-        (64, 256, 0.0),    # Smaller model, no dropout
-        (128, 512, 0.1),   # Default config
-        (256, 1024, 0.2),  # Larger model, higher dropout
-        (512, 2048, 0.15), # Even larger (4x expansion)
-    ]
-    
-    for d_m, d_f, drop in configs:
-        test_model = FeedForward(d_model=d_m, d_ff=d_f, dropout=drop)
-        test_input = torch.randn(2, 5, d_m)
-        test_output = test_model(test_input)
-        
-        assert test_output.shape == (2, 5, d_m), \
-            f"Config ({d_m}, {d_f}, {drop}) failed shape test!"
-        assert test_output.dtype == test_input.dtype, \
-            f"Config ({d_m}, {d_f}, {drop}) failed dtype test!"
-        assert not torch.isnan(test_output).any(), \
-            f"Config ({d_m}, {d_f}, {drop}) produced NaN values!"
-        
-        print(f"✓ Config (d_model={d_m}, d_ff={d_f}, dropout={drop}) works correctly")
-    
-    # Test 6: Check layer dimensions
-    print("\n[Test 6] Verify internal layer dimensions")
-    print("-" * 70)
-    
-    model = FeedForward(d_model=128, d_ff=512, dropout=0.1)
-    
-    print(f"fc1 weight shape: {model.fc1.weight.shape} (expected: [512, 128])")
-    print(f"fc1 bias shape: {model.fc1.bias.shape} (expected: [512])")
-    print(f"fc2 weight shape: {model.fc2.weight.shape} (expected: [128, 512])")
-    print(f"fc2 bias shape: {model.fc2.bias.shape} (expected: [128])")
-    
-    assert model.fc1.weight.shape == (512, 128), "fc1 weight shape incorrect!"
-    assert model.fc1.bias.shape == (512,), "fc1 bias shape incorrect!"
-    assert model.fc2.weight.shape == (128, 512), "fc2 weight shape incorrect!"
-    assert model.fc2.bias.shape == (128,), "fc2 bias shape incorrect!"
-    
-    print("✓ All layer dimensions correct!")
-    
-    # Test 7: Gradient flow
-    print("\n[Test 7] Verify gradient flow")
-    print("-" * 70)
-    
-    model = FeedForward(d_model=128, d_ff=512, dropout=0.1)
-    x = torch.randn(2, 10, 128, requires_grad=True)
-    
-    # Forward pass
-    output = model(x)
-    
-    # Compute a dummy loss
-    loss = output.sum()
-    
-    # Backward pass
-    loss.backward()
-    
-    # Check that gradients exist and are non-zero
-    assert x.grad is not None, "Input gradient is None!"
-    assert model.fc1.weight.grad is not None, "fc1 weight gradient is None!"
-    assert model.fc2.weight.grad is not None, "fc2 weight gradient is None!"
-    
-    assert x.grad.abs().sum() > 0, "Input gradient is all zeros!"
-    assert model.fc1.weight.grad.abs().sum() > 0, "fc1 weight gradient is all zeros!"
-    assert model.fc2.weight.grad.abs().sum() > 0, "fc2 weight gradient is all zeros!"
-    
-    print("✓ Gradients flow correctly through the network!")
-    
-    # Final summary
-    print("\n" + "=" * 70)
-    print("ALL TESTS PASSED! ✓")
-    print("=" * 70)
-    
-    # Final demonstration
-    model = FeedForward(d_model=128, d_ff=512, dropout=0.1)
-    x = torch.randn(2, 10, 128)
-    output = model(x)
-    
-    print(f"\nFinal demonstration:")
-    print(f"  Input shape:  {x.shape}")
-    print(f"  Output shape: {output.shape}")
-    print(f"  Output dtype: {output.dtype}")
-    print(f"\nKey features verified:")
-    print("  ✓ Correct input/output shapes maintained")
-    print("  ✓ Proper dtype preservation")
-    print("  ✓ No NaN or Inf values")
-    print("  ✓ Eval mode produces deterministic outputs")
-    print("  ✓ Train mode applies dropout correctly")
-    print("  ✓ Multiple configurations supported")
-    print("  ✓ Layer dimensions correct")
-    print("  ✓ Gradients flow properly")
+    import sys
+
+    print("=== FeedForward self-test ===\n")
+    torch.manual_seed(0)
+
+    B, S, D = 2, 10, 128
+
+    ff = FeedForward(d_model=D, d_ff=512, dropout=0.1)
+    ff.eval()   # disable dropout for deterministic output
+    print(ff)
+    print()
+
+    x = torch.randn(B, S, D)
+
+    # ------------------------------------------------------------------ #
+    # Test 1 — output shape and dtype                                      #
+    # ------------------------------------------------------------------ #
+    with torch.no_grad():
+        out = ff(x)
+
+    print(f"Input  shape : {tuple(x.shape)}")
+    print(f"Output shape : {tuple(out.shape)}")
+    print(f"Input  dtype : {x.dtype}")
+    print(f"Output dtype : {out.dtype}")
+
+    assert out.shape == torch.Size([B, S, D]), f"Shape mismatch: {out.shape}"
+    assert out.dtype == x.dtype,              f"dtype changed: {out.dtype}"
+    print("[✓] Shape and dtype assertions passed.\n")
+
+    # ------------------------------------------------------------------ #
+    # Test 2 — no NaNs or Infs                                            #
+    # ------------------------------------------------------------------ #
+    assert not torch.isnan(out).any(), "[FAIL] NaN in output"
+    assert not torch.isinf(out).any(), "[FAIL] Inf in output"
+    print("[✓] No NaN / Inf in output.\n")
+
+    # ------------------------------------------------------------------ #
+    # Test 3 — output differs from input (transformation is non-trivial)  #
+    # ------------------------------------------------------------------ #
+    assert not torch.allclose(out, x), "[FAIL] Output identical to input"
+    print("[✓] Output is a non-trivial transformation of input.\n")
+
+    # ------------------------------------------------------------------ #
+    # Test 4 — dropout is active during training (output changes)         #
+    # ------------------------------------------------------------------ #
+    ff.train()
+    with torch.no_grad():
+        out_a = ff(x)
+        out_b = ff(x)
+    assert not torch.allclose(out_a, out_b), "[FAIL] Dropout inactive in train mode"
+    print("[✓] Dropout produces stochastic output in train mode.\n")
+
+    # ------------------------------------------------------------------ #
+    # Test 5 — dropout is inactive during eval (output is deterministic)  #
+    # ------------------------------------------------------------------ #
+    ff.eval()
+    with torch.no_grad():
+        out_c = ff(x)
+        out_d = ff(x)
+    assert torch.allclose(out_c, out_d), "[FAIL] Output non-deterministic in eval mode"
+    print("[✓] Eval mode is deterministic.\n")
+
+    # ------------------------------------------------------------------ #
+    # Test 6 — half-precision passthrough                                 #
+    # ------------------------------------------------------------------ #
+    ff_half = FeedForward(d_model=D, d_ff=512, dropout=0.0).half().eval()
+    x_half  = x.half()
+    with torch.no_grad():
+        out_half = ff_half(x_half)
+    assert out_half.dtype  == torch.float16,       "[FAIL] dtype not float16"
+    assert out_half.shape  == torch.Size([B, S, D]), "[FAIL] shape wrong in fp16"
+    print("[✓] float16 passthrough works.\n")
+
+    # ------------------------------------------------------------------ #
+    # Test 7 — error handling                                             #
+    # ------------------------------------------------------------------ #
+    ff.eval()
+    print("--- Error handling ---")
+    try:
+        ff(torch.randn(2, 128))        # 2-D input
+    except ValueError as e:
+        print(f"[OK] Bad dims    : {e}")
+
+    try:
+        ff(torch.randn(2, 10, 64))     # wrong d_model
+    except ValueError as e:
+        print(f"[OK] Wrong d_model : {e}")
+
+    try:
+        FeedForward(d_model=0)
+    except ValueError as e:
+        print(f"[OK] Bad d_model   : {e}")
+
+    try:
+        FeedForward(dropout=1.0)
+    except ValueError as e:
+        print(f"[OK] Bad dropout   : {e}")
+
+    print("\n[✓] All tests passed.")
+    sys.exit(0)

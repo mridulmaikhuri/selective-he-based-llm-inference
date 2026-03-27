@@ -97,4 +97,5 @@ htmlcov/
 .env.*
 config_local.yaml
 secrets.yaml
+activation_plots/
 

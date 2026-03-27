@@ -15,12 +15,19 @@ _GELU_COEFFS: Dict[int, np.ndarray] = {}
 _EXP_COEFFS: Dict[int, np.ndarray] = {}
 
 
+def _get_chebyshev_nodes(a: float, b: float, n: int) -> np.ndarray:
+    """Generate n Chebyshev nodes over the interval [a, b]."""
+    k = np.arange(1, n + 1)
+    roots = np.cos((2 * k - 1) / (2 * n) * np.pi)
+    return 0.5 * (a + b) + 0.5 * (b - a) * roots
+
+
 def _fit_gelu_polynomials(degrees: List[int] = DEGREES) -> None:
     """
     Fit least-squares polynomial approximations for GELU on [-5, 5].
     Stores coefficients in global _GELU_COEFFS (highest power first).
     """
-    xs = np.linspace(-5.0, 5.0, 2001, dtype=np.float64)
+    xs = _get_chebyshev_nodes(-5.0, 5.0, 2000)
     xs_t = torch.from_numpy(xs).float()
     ys = F.gelu(xs_t).numpy().astype(np.float64)
 
@@ -35,7 +42,7 @@ def _fit_exp_polynomials(degrees: List[int] = DEGREES) -> None:
     Used inside a numerically stable softmax approximation.
     Stores coefficients in global _EXP_COEFFS.
     """
-    zs = np.linspace(-10.0, 0.0, 2001, dtype=np.float64)
+    zs = _get_chebyshev_nodes(-10.0, 0.0, 2000)
     ys = np.exp(zs)
 
     for d in degrees:
@@ -116,7 +123,7 @@ def softmax_approx(x: torch.Tensor, degree: int = 5, dim: int = -1) -> torch.Ten
     numerically-stable range plus standard max-subtraction.
 
     Steps:
-      1. Shift logits by subtracting max along `dim` (stability).
+      1. Shift logits by subtracting max along dim (stability).
       2. Clamp z in [-10, 0] and approximate exp(z) with a degree-d polynomial.
       3. Normalize approximate exp values to get a probability distribution.
 
@@ -238,4 +245,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

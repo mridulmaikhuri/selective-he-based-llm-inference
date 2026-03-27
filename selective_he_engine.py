@@ -126,7 +126,7 @@ def selective_HE_inference(
         print("=" * 80)
         print("SELECTIVE HOMOMORPHIC ENCRYPTION INFERENCE")
         print("=" * 80)
-        print(f"Model: {model.__class__.__name__}")
+        print(f"Model: {model._class.name_}")
         print(f"Input shape: {input_ids.shape}")
         print(f"Encryption config: granularity={config.encryption_granularity}")
         print(f"Layers to encrypt: {config.layers_to_encrypt}")
@@ -283,16 +283,6 @@ def selective_HE_inference(
                     
                     if verbose:
                         print(f"✓ {block_name} (plaintext): {plain_time:.2f} ms")
-                timing_dict['layer_timings'][block_name] = {
-                    'time_ms': plain_time,
-                    'encrypted': False,
-                    'type': 'transformer_block'
-                }
-                encryption_state_log.append((block_name, False))
-                encryption_state.mark_plaintext(block_name)
-                
-                if verbose:
-                    print(f"✓ {block_name} (plaintext): {plain_time:.2f} ms")
     
     # ========================================================================
     # PHASE 3: Final Layer Norm

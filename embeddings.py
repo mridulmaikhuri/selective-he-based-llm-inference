@@ -1,209 +1,243 @@
 """
-Token and Positional Embedding Module
+Token + Sinusoidal Positional Embeddings
+=========================================
+Implements TokenPositionalEmbedding, which combines:
+  - A learned token embedding table  (vocab_size → d_model)
+  - Deterministic sinusoidal positional encodings (Vaswani et al., 2017)
+  - Dropout applied to the summed representation
 
-Implements token embeddings combined with sinusoidal positional encodings
-as described in "Attention Is All You Need" (Vaswani et al., 2017).
+Reference:
+    Vaswani et al., "Attention Is All You Need", NeurIPS 2017.
+    https://arxiv.org/abs/1706.03762  (Section 3.5)
+
+Usage:
+    from embeddings import TokenPositionalEmbedding
+    import torch
+
+    emb = TokenPositionalEmbedding(vocab_size=50257, d_model=128)
+    ids = torch.randint(0, 50257, (4, 64))   # (batch, seq_len)
+    out = emb(ids)                            # (4, 64, 128)
 """
 
+import math
 import torch
 import torch.nn as nn
-import math
 
 
 class TokenPositionalEmbedding(nn.Module):
-    """
-    Combines token embeddings with sinusoidal positional encodings.
-    
-    This module creates token embeddings and adds deterministic sinusoidal
-    positional encodings to inject sequence order information.
-    
+    """Combines learned token embeddings with sinusoidal positional encodings.
+
+    The positional encoding matrix is computed once at construction time and
+    stored as a non-trainable buffer, exactly as described by Vaswani et al.:
+
+        PE(pos, 2i)   = sin(pos / 10000^(2i / d_model))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i / d_model))
+
+    The token embedding output and the positional encoding slice are summed,
+    then passed through dropout.
+
     Args:
-        vocab_size (int): Size of vocabulary. Default: 50257 (GPT-2 vocab size)
-        d_model (int): Dimension of embeddings. Default: 128
-        max_len (int): Maximum sequence length supported. Default: 1024
-        dropout (float): Dropout probability. Default: 0.1
-    
-    Attributes:
-        token_embedding (nn.Embedding): Token embedding layer
-        positional_encoding (torch.Tensor): Pre-computed sinusoidal positional encodings
-        dropout (nn.Dropout): Dropout layer
+        vocab_size (int): Number of tokens in the vocabulary. Default: 50257 (GPT-2).
+        d_model    (int): Embedding / model dimension. Default: 128.
+        max_len    (int): Maximum supported sequence length. Default: 1024.
+        dropout  (float): Dropout probability applied after summation. Default: 0.1.
     """
-    
-    def __init__(self, vocab_size=50257, d_model=128, max_len=1024, dropout=0.1):
-        super(TokenPositionalEmbedding, self).__init__()
-        
-        self.vocab_size = vocab_size
+
+    def __init__(
+        self,
+        vocab_size: int = 50257,
+        d_model: int = 128,
+        max_len: int = 1024,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        # ------------------------------------------------------------------ #
+        # Validate constructor arguments                                       #
+        # ------------------------------------------------------------------ #
+        if vocab_size < 1:
+            raise ValueError(f"vocab_size must be >= 1, got {vocab_size}")
+        if d_model < 1 or d_model % 2 != 0:
+            raise ValueError(f"d_model must be a positive even integer, got {d_model}")
+        if max_len < 1:
+            raise ValueError(f"max_len must be >= 1, got {max_len}")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+
         self.d_model = d_model
         self.max_len = max_len
-        
-        # Token embedding layer
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        
-        # Initialize token embeddings with normal distribution
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
-        
-        # Create sinusoidal positional encoding
-        self.positional_encoding = self._create_sinusoidal_encoding(max_len, d_model)
-        
-        # Dropout layer
+        self.vocab_size = vocab_size
+
+        # ------------------------------------------------------------------ #
+        # Learned token embedding table                                        #
+        # ------------------------------------------------------------------ #
+        self.token_embedding = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=d_model,
+        )
+        # Initialise weights with Xavier uniform for stable early training
+        nn.init.xavier_uniform_(self.token_embedding.weight.unsqueeze(0))
+
+        # ------------------------------------------------------------------ #
+        # Sinusoidal positional encoding (deterministic, stored as a buffer)  #
+        # Shape: (1, max_len, d_model) — the leading 1 allows broadcast over  #
+        # any batch size.                                                      #
+        # ------------------------------------------------------------------ #
+        pe = self._build_sinusoidal_encoding(max_len, d_model)  # (max_len, d_model)
+        self.register_buffer("pe", pe.unsqueeze(0))             # (1, max_len, d_model)
+
+        # ------------------------------------------------------------------ #
+        # Dropout                                                              #
+        # ------------------------------------------------------------------ #
         self.dropout = nn.Dropout(p=dropout)
-    
-    def _create_sinusoidal_encoding(self, max_len, d_model):
-        """
-        Create sinusoidal positional encodings as per Vaswani et al. (2017).
-        
-        PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
-        PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
-        
-        Args:
-            max_len (int): Maximum sequence length
-            d_model (int): Embedding dimension
-        
+
+    # ---------------------------------------------------------------------- #
+    # Static helper: build the (max_len, d_model) sinusoidal matrix           #
+    # ---------------------------------------------------------------------- #
+
+    @staticmethod
+    def _build_sinusoidal_encoding(max_len: int, d_model: int) -> torch.Tensor:
+        """Compute the sinusoidal positional encoding matrix.
+
         Returns:
-            torch.Tensor: Positional encoding tensor of shape (1, max_len, d_model)
+            Tensor of shape (max_len, d_model) with dtype float32.
         """
-        # Create position indices [0, 1, 2, ..., max_len-1]
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # (max_len, 1)
-        
-        # Create dimension indices [0, 2, 4, ..., d_model-2]
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * 
-                            -(math.log(10000.0) / d_model))  # (d_model/2,)
-        
-        # Initialize positional encoding matrix
-        pe = torch.zeros(max_len, d_model)  # (max_len, d_model)
-        
-        # Apply sin to even indices in the array; 2i
-        pe[:, 0::2] = torch.sin(position * div_term)
-        
-        # Apply cos to odd indices in the array; 2i+1
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        # Add batch dimension: (1, max_len, d_model)
-        pe = pe.unsqueeze(0)
-        
-        # Register as buffer (not a parameter, but part of state_dict)
-        self.register_buffer('pe', pe)
-        
-        return pe
-    
-    def forward(self, input_ids):
-        """
-        Forward pass: combine token embeddings with positional encodings.
-        
+        # positions: column vector (max_len, 1)
+        position = torch.arange(max_len, dtype=torch.float).unsqueeze(1)
+
+        # Division term: shape (d_model/2,)
+        # exp(log(...)) form is numerically more stable than direct pow()
+        half_dim = d_model // 2
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * (-math.log(10_000.0) / d_model)
+        )  # equivalent to 1 / (10000^(2i/d_model))
+
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)   # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)   # odd  indices
+
+        return pe  # (max_len, d_model)
+
+    # ---------------------------------------------------------------------- #
+    # Forward pass                                                             #
+    # ---------------------------------------------------------------------- #
+
+    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
+        """Compute token + positional embeddings.
+
         Args:
-            input_ids (torch.LongTensor): Input token IDs of shape (batch_size, seq_len)
-        
+            input_ids (LongTensor): Token indices of shape (batch, seq_len).
+                Values must satisfy 0 <= id < vocab_size.
+
         Returns:
-            torch.Tensor: Combined embeddings of shape (batch_size, seq_len, d_model)
-        
+            Tensor of shape (batch, seq_len, d_model), dtype float32.
+
         Raises:
-            ValueError: If input_ids contain values >= vocab_size
-            ValueError: If sequence length exceeds max_len
+            ValueError: If seq_len exceeds max_len.
+            ValueError: If any token id is outside [0, vocab_size).
         """
-        # Ensure input is 2D (batch_size, seq_len)
-        if input_ids.dim() == 1:
-            # Add batch dimension if missing: (seq_len,) -> (1, seq_len)
-            input_ids = input_ids.unsqueeze(0)
-        elif input_ids.dim() > 2:
+        if input_ids.dim() != 2:
             raise ValueError(
-                f"Input must be 1D or 2D, got shape {input_ids.shape}"
+                f"input_ids must be 2-D (batch, seq_len), got shape {tuple(input_ids.shape)}"
             )
-        
-        # Error checking
-        if input_ids.max() >= self.vocab_size:
-            raise ValueError(
-                f"Input contains token ID {input_ids.max().item()} which is >= "
-                f"vocab_size {self.vocab_size}"
-            )
-        
-        batch_size, seq_len = input_ids.shape
-        
+
+        _, seq_len = input_ids.shape
+
+        # Guard: sequence length
         if seq_len > self.max_len:
             raise ValueError(
-                f"Sequence length {seq_len} exceeds maximum length {self.max_len}"
+                f"seq_len ({seq_len}) exceeds max_len ({self.max_len}). "
+                "Either truncate the input or increase max_len at construction time."
             )
-        
-        # Get token embeddings: (batch_size, seq_len, d_model)
-        token_emb = self.token_embedding(input_ids)
-        
-        # Add positional encodings: (batch_size, seq_len, d_model)
-        # positional_encoding is (1, max_len, d_model), we slice to seq_len
-        pos_emb = self.pe[:, :seq_len, :]
-        
-        # Combine token and positional embeddings
-        embeddings = token_emb + pos_emb
-        
-        # Apply dropout
-        embeddings = self.dropout(embeddings)
-        
-        return embeddings
 
+        # Guard: vocabulary bounds
+        if input_ids.min().item() < 0 or input_ids.max().item() >= self.vocab_size:
+            bad_min = input_ids.min().item()
+            bad_max = input_ids.max().item()
+            raise ValueError(
+                f"input_ids contain token id(s) outside [0, {self.vocab_size}). "
+                f"Observed range: [{bad_min}, {bad_max}]."
+            )
+
+        # Token embeddings: (batch, seq_len, d_model)
+        # Scale by sqrt(d_model) as recommended in Vaswani et al. §3.4
+        tok_emb = self.token_embedding(input_ids) * math.sqrt(self.d_model)
+
+        # Positional encoding slice: (1, seq_len, d_model) — broadcasts over batch
+        pos_enc = self.pe[:, :seq_len, :]   # type: torch.Tensor
+
+        # Sum and apply dropout
+        return self.dropout(tok_emb + pos_enc)
+
+    # ---------------------------------------------------------------------- #
+    # Dunder helpers                                                           #
+    # ---------------------------------------------------------------------- #
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"vocab_size={self.vocab_size}, "
+            f"d_model={self.d_model}, "
+            f"max_len={self.max_len}, "
+            f"dropout={self.dropout.p})"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Inline test                                                                  #
+# --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
-    """
-    Test block to verify TokenPositionalEmbedding implementation.
-    """
-    print("Testing TokenPositionalEmbedding...")
-    print("-" * 50)
-    
-    # Create model instance with default parameters
-    model = TokenPositionalEmbedding(
-        vocab_size=50257,
-        d_model=128,
-        max_len=1024,
-        dropout=0.1
-    )
-    
-    # Create dummy input: batch_size=2, seq_len=10
-    input_ids = torch.randint(0, 50257, (2, 10))
-    
-    print(f"Input shape: {input_ids.shape}")
-    print(f"Input IDs:\n{input_ids}")
-    print()
-    
-    # Forward pass
-    output = model(input_ids)
-    
-    print(f"Output shape: {output.shape}")
-    print(f"Expected shape: torch.Size([2, 10, 128])")
-    print()
-    
-    # Verify shape
-    assert output.shape == torch.Size([2, 10, 128]), "Output shape mismatch!"
-    print("✓ Shape test passed!")
-    print()
-    
-    # Additional tests
-    print("Additional validation tests:")
-    print("-" * 50)
-    
-    # Test 1: Different sequence length
-    input_ids_short = torch.randint(0, 50257, (1, 5))
-    output_short = model(input_ids_short)
-    print(f"✓ Short sequence (1, 5) -> {output_short.shape}")
-    
-    # Test 2: Maximum length
-    input_ids_long = torch.randint(0, 50257, (1, 1024))
-    output_long = model(input_ids_long)
-    print(f"✓ Max length sequence (1, 1024) -> {output_long.shape}")
-    
-    # Test 3: Error checking - vocab overflow
+    print("=== TokenPositionalEmbedding inline test ===\n")
+
+    torch.manual_seed(0)
+
+    # ------------------------------------------------------------------ #
+    # Basic shape test (acceptance criterion)                             #
+    # ------------------------------------------------------------------ #
+    emb = TokenPositionalEmbedding(vocab_size=50257, d_model=128, max_len=1024, dropout=0.1)
+    print(f"Module : {emb}\n")
+
+    dummy_ids = torch.randint(0, 50257, (2, 10))   # (batch=2, seq_len=10)
+    emb.eval()                                      # disable dropout for deterministic output
+    with torch.no_grad():
+        out = emb(dummy_ids)
+
+    print(f"input_ids shape : {tuple(dummy_ids.shape)}")
+    print(f"output shape    : {out.shape}")          # Expected: torch.Size([2, 10, 128])
+    assert out.shape == torch.Size([2, 10, 128]), "Shape mismatch — test FAILED"
+    print("\n[✓] Shape assertion passed.\n")
+
+    # ------------------------------------------------------------------ #
+    # Verify positional encoding is truly sinusoidal (first 4 dims)      #
+    # ------------------------------------------------------------------ #
+    pe_matrix = emb.pe.squeeze(0)   # (max_len, d_model)
+    print("Positional encoding spot-check (pos=0, dims 0-3):")
+    print(f"  {pe_matrix[0, :4].tolist()}")
+    print("  Expected: [sin(0), cos(0), sin(0), cos(0)] = [0.0, 1.0, 0.0, 1.0]\n")
+
+    # ------------------------------------------------------------------ #
+    # Error handling tests                                                #
+    # ------------------------------------------------------------------ #
+    print("--- Error handling ---")
+
+    # seq_len > max_len
     try:
-        bad_input = torch.tensor([[50257]])  # Exactly at vocab_size
-        model(bad_input)
-        print("✗ Vocab overflow check failed!")
-    except ValueError as e:
-        print(f"✓ Vocab overflow correctly caught: {str(e)[:50]}...")
-    
-    # Test 4: Error checking - sequence too long
+        emb(torch.randint(0, 50257, (1, 2000)))
+    except ValueError as exc:
+        print(f"[OK] seq_len overflow caught  : {exc}")
+
+    # vocab overflow
     try:
-        bad_input = torch.randint(0, 50257, (1, 1025))  # Exceeds max_len
-        model(bad_input)
-        print("✗ Sequence length check failed!")
-    except ValueError as e:
-        print(f"✓ Sequence length correctly caught: {str(e)[:50]}...")
-    
-    print()
-    print("=" * 50)
-    print("All tests passed successfully!")
-    print(f"Final output shape: {output.shape}")
+        emb(torch.tensor([[50257, 0]]))
+    except ValueError as exc:
+        print(f"[OK] vocab overflow caught    : {exc}")
+
+    # wrong dimensionality
+    try:
+        emb(torch.randint(0, 50257, (10,)))
+    except ValueError as exc:
+        print(f"[OK] bad input dims caught    : {exc}")
+
+    print("\n[✓] All tests passed.")

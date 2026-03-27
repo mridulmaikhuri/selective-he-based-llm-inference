@@ -122,11 +122,22 @@ def warmup_runs(
     """
     model.eval()
     input_list = _ensure_tensor_iter(inputs)
-    infer_fn, _ = _build_method_inference(model, method)
+    infer_fn, meta = _build_method_inference(model, method)
 
     for _ in range(max(0, n_warmup)):
         for x in input_list:
-            _ = infer_fn(x)
+            try:
+                _ = infer_fn(x)
+            except ValueError as e:
+                # Skip warmup for methods that have unsupported configurations
+                # (e.g., full HE with large d_model)
+                if "full HE" in str(e) or "too large" in str(e):
+                    # Log warning instead of crashing
+                    import logging
+                    logging.warning(f"Skipping warmup for method '{method}': {e}")
+                    return
+                else:
+                    raise
     _maybe_synchronize_cuda(model)
 
 
@@ -168,7 +179,30 @@ def time_inference(
 
             _maybe_synchronize_cuda(model)
             t0 = time.perf_counter()
-            _ = infer_fn(x)
+            try:
+                _ = infer_fn(x)
+            except ValueError as e:
+                # Handle unsupported HE configurations
+                if "full HE" in str(e) or "too large" in str(e):
+                    import logging
+                    logging.error(f"Method '{method}' failed: {e}")
+                    # Return error result
+                    return {
+                        "status": "error",
+                        "method": method,
+                        "error": str(e),
+                        "TTFT": float('inf'),
+                        "avg_latency_per_token": float('inf'),
+                        "throughput": 0.0,
+                        "stats": {
+                            "mean_ms": float('inf'),
+                            "std_ms": 0.0,
+                            "min_ms": float('inf'),
+                            "max_ms": float('inf')
+                        }
+                    }
+                else:
+                    raise
             _maybe_synchronize_cuda(model)
             t1 = time.perf_counter()
 
@@ -323,7 +357,26 @@ def memory_profiling(
 
     _maybe_synchronize_cuda(model)
     t0 = time.perf_counter()
-    _ = infer_fn(sample_input)
+    try:
+        _ = infer_fn(sample_input)
+    except ValueError as e:
+        # Handle unsupported HE configurations
+        if "full HE" in str(e) or "too large" in str(e):
+            import logging
+            logging.error(f"Method '{method}' failed in memory profiling: {e}")
+            # Return error result
+            return {
+                "status": "error",
+                "method": method,
+                "error": str(e),
+                "elapsed_ms": float('inf'),
+                "peak_ram_mb": 0.0,
+                "peak_vram_mb": 0.0,
+                "he_num_ciphertexts_est": 0,
+                "he_ciphertext_memory_mb": 0.0,
+            }
+        else:
+            raise
     _maybe_synchronize_cuda(model)
     t1 = time.perf_counter()
 
@@ -345,10 +398,17 @@ def memory_profiling(
         from he_utils import setup_HE_context
         from he_inference import full_he_inference
 
-        HE = setup_HE_context(n=2 ** 14, t=65537)
-        _, _, mem_info = full_he_inference(model, sample_input, HE)
-        he_ciphertexts_est = int(mem_info.get("peak_ciphertexts", 0))
-        he_ciphertext_mb = float(mem_info.get("est_ciphertext_size_mb", 0.0))
+        try:
+            HE = setup_HE_context(n=2 ** 14, t=65537)
+            _, _, mem_info = full_he_inference(model, sample_input, HE)
+            he_ciphertexts_est = int(mem_info.get("peak_ciphertexts", 0))
+            he_ciphertext_mb = float(mem_info.get("est_ciphertext_size_mb", 0.0))
+        except ValueError as e:
+            # Full HE not supported for this model size - log and continue
+            import logging
+            logging.warning(f"Full HE memory profiling skipped: {e}")
+            he_ciphertexts_est = 0
+            he_ciphertext_mb = 0.0
     elif meta.get("he_type") == "selective":
         # Very rough estimate based on sequence length and hidden size.
         seq_len = sample_input.shape[1]

@@ -196,6 +196,17 @@ def full_he_inference(
             f"Only batch_size=1, seq_len=1 supported. Got ({batch_size}, {seq_len})"
         )
     
+    # Check model d_model against HE attention limit
+    # he_attention_approx interprets the ciphertext list length as seq_len  
+    # and has a max of 16 to avoid noise overflow
+    d_model = model.d_model
+    if d_model > 16:
+        raise ValueError(
+            f"Model d_model={d_model} too large for full HE (max 16). "
+            f"HE attention approximation limited to 16 dimensions to avoid noise overflow. "
+            f"Consider using selective HE strategies instead."
+        )
+    
     timings = {}
     memory_info: Dict[str, Any] = {
         'num_ciphertexts': 0,
@@ -218,7 +229,7 @@ def full_he_inference(
     print(f"  Input token ID: {token_id}")
     
     # Get plaintext embedding
-    embedding_vec = model.embeddings.weight[token_id]  # shape (embed_dim,)
+    embedding_vec = model.embedding.token_embedding.weight[token_id]  # shape (embed_dim,)
     print(f"  Embedding shape: {embedding_vec.shape}")
     print(f"  Embedding sample values: {embedding_vec[:4].tolist()}")
     
@@ -240,7 +251,7 @@ def full_he_inference(
     enc_hidden = enc_embedding
     timings['transformer_blocks'] = []
     
-    for block_idx, block in enumerate(model.transformer_blocks):
+    for block_idx, block in enumerate(model.blocks):
         print(f"\n  Block {block_idx}:")
         block_start = time.perf_counter()
         
@@ -249,9 +260,9 @@ def full_he_inference(
         attn_start = time.perf_counter()
         
         # Get Q, K, V projections (plaintext weights, encrypted hidden)
-        W_q = block['self_attn_q'].weight.detach().cpu().numpy().astype(np.float32)  # type: ignore  # Keep as float
-        W_k = block['self_attn_k'].weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
-        W_v = block['self_attn_v'].weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        W_q = block.attention.q_proj.weight.detach().cpu().numpy().astype(np.float32)  # type: ignore  # Keep as float
+        W_k = block.attention.k_proj.weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        W_v = block.attention.v_proj.weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
         
         # Scale weights for integer multiplication
         W_q = (W_q * SCALE_FACTOR).astype(np.int32)
@@ -269,8 +280,8 @@ def full_he_inference(
         enc_attn_out = he_attention_approx(enc_Q, enc_K, enc_V, HE, causal_mask=False)
         
         # Attention output projection
-        W_attn_out = block['attn_out'].weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
-        b_attn_out = block['attn_out'].bias.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        W_attn_out = block.attention.out_proj.weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        b_attn_out = block.attention.out_proj.bias.detach().cpu().numpy().astype(np.float32)  # type: ignore
         W_attn_out = (W_attn_out * SCALE_FACTOR).astype(np.int32)
         b_attn_out = (b_attn_out * SCALE_FACTOR).astype(np.int32)
         enc_attn_proj = he_linear(enc_attn_out, torch.from_numpy(W_attn_out).T, 
@@ -287,10 +298,10 @@ def full_he_inference(
         print(f"    [FFN]")
         ffn_start = time.perf_counter()
         
-        W_ffn_in = block['ffn_in'].weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
-        b_ffn_in = block['ffn_in'].bias.detach().cpu().numpy().astype(np.float32)  # type: ignore
-        W_ffn_out = block['ffn_out'].weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
-        b_ffn_out = block['ffn_out'].bias.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        W_ffn_in = block.ffn.fc1.weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        b_ffn_in = block.ffn.fc1.bias.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        W_ffn_out = block.ffn.fc2.weight.detach().cpu().numpy().astype(np.float32)  # type: ignore
+        b_ffn_out = block.ffn.fc2.bias.detach().cpu().numpy().astype(np.float32)  # type: ignore
         
         W_ffn_in = (W_ffn_in * SCALE_FACTOR).astype(np.int32)
         b_ffn_in = (b_ffn_in * SCALE_FACTOR).astype(np.int32)

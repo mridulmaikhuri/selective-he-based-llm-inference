@@ -148,7 +148,7 @@ def he_linear(
             # Add bias if provided
             if plain_bias is not None:
                 bias_val = int(plain_bias[j])
-                acc = acc + bias_val
+                acc += bias_val
         
         encrypted_outputs.append(acc)
     
@@ -470,7 +470,7 @@ def test_he_attention_demo() -> None:
     output_enc = he_attention_approx(Q_enc, K_enc, V_enc, HE, causal_mask=False)
     he_attn_time = (time.perf_counter() - start) * 1000
     print(f"  HE attention computed in {he_attn_time:.2f} ms")
-    print(f"  Operations: {seq_len**2} logits + {seq_len**2} weights + "
+    print(f"  Operations: {seq_len*2} logits + {seq_len*2} weights + "
           f"{seq_len**2} value multiplies")
     
     # Decrypt result
@@ -539,6 +539,6 @@ def test_he_attention_demo() -> None:
     print("=" * 80 + "\n")
 
 
-if __name__ == "__main__":
+if __name__== "__main__":
     test_he_linear_demo()
     test_he_attention_demo()

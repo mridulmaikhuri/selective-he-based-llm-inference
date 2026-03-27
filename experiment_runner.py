@@ -187,8 +187,8 @@ def run_experiments(
     else:
         lengths = [10, 50, 100, 200]
         num_per_length = 25  # 100 prompts total
-        # Omit strategy3 from comparisons; too heavy / unstable in practice.
-        methods = ["plain", "full_he", "strategy1", "strategy2"]
+        # Strategy3 is heavy but we include it for complete results per the user's request.
+        methods = ["plain", "full_he", "strategy1", "strategy2", "strategy3"]
         n_runs = 5
 
     print(
@@ -410,4 +410,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
