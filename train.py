@@ -1,360 +1,466 @@
 """
-Training Script for TinyGPT (step-driven, no epochs)
+train.py
+========
+Robust next-token prediction training loop for TinyGPT.
 
-Usage examples:
-    python train.py --data-dir data/ --max-steps 5000
-    python train.py --data-dir data/ --max-steps 100 --batch-size 16 --accum-steps 2 --fp16
+CLI usage examples:
+    # Minimal run (10 steps, quick smoke-test)
+    python train.py --data-dir data/ --max-steps 10
+
+    # Full training run
+    python train.py --data-dir data/ --max-steps 5000 --batch-size 16
+
+    # 1-epoch run with FP16 and gradient accumulation
+    python train.py --data-dir data/ --epochs 1 --fp16 --accum-steps 4
+
+    # Custom LR and output directory
+    python train.py --data-dir data/ --max-steps 5000 --lr 3e-4 --out-dir runs/exp1/
 """
 
 import argparse
-import os
 import math
+import os
+import sys
+import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("[warn] tqdm not found — install with: pip install tqdm")
+    # Minimal fallback so the script still runs
+    class tqdm:  # type: ignore
+        def __init__(self, iterable=None, **kw):
+            self._it = iterable
+        def __iter__(self):
+            return iter(self._it)
+        def set_postfix(self, **kw): pass
+        def update(self, n=1): pass
+        def close(self): pass
 
 from model import TinyGPT, count_parameters
 
 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 class TokenDataset(Dataset):
-    """Dataset expecting a 1D token stream (will flatten if needed). Produces (x, y) pairs of length seq_len."""
-    def __init__(self, data_path, seq_len=128):
-        if not os.path.exists(data_path):
-            raise FileNotFoundError(f"Dataset file not found: {data_path}")
+    """
+    Wraps a 1-D or 2-D long tensor of token IDs into (input, target) pairs
+    for next-token prediction.
 
-        print(f"Loading dataset from {data_path}...")
-        self.data = torch.load(data_path)
+    If the tensor is 1-D (flat token sequence) it is chunked into fixed-length
+    windows of `seq_len` tokens; the target is the sequence shifted by 1.
 
-        if isinstance(self.data, dict):
-            # accept {"input_ids": ...} style files
-            if 'input_ids' in self.data:
-                self.data = self.data['input_ids']
-            elif 'tokens' in self.data:
-                self.data = self.data['tokens']
-            else:
-                raise ValueError(f"Unknown data format in {data_path}")
+    If the tensor is 2-D (B, S) each row is treated as one sample and the
+    target is shifted by 1 along the sequence axis (last token of target is
+    ignored via ignore_index in the loss).
+    """
 
-        if not isinstance(self.data, torch.Tensor):
-            self.data = torch.tensor(self.data, dtype=torch.long)
+    def __init__(self, data: torch.Tensor, seq_len: int = 128):
+        if data.ndim == 1:
+            # Chunk flat sequence into (seq_len + 1) windows; drop remainder
+            n_chunks = (len(data) - 1) // seq_len
+            self.data = data[: n_chunks * seq_len + 1]
+            self.seq_len = seq_len
+            self.flat = True
+        elif data.ndim == 2:
+            self.data = data
+            self.seq_len = data.shape[1]
+            self.flat = False
+        else:
+            raise ValueError(f"Expected 1-D or 2-D tensor, got shape {data.shape}")
 
-        # Flatten multi-d tensors to 1D token stream
-        if self.data.dim() > 1:
-            print(f"  Warning: Data has shape {self.data.shape}, flattening to 1D")
-            self.data = self.data.view(-1)
+    def __len__(self) -> int:
+        if self.flat:
+            return (len(self.data) - 1) // self.seq_len
+        return len(self.data)
 
-        if self.data.dtype not in [torch.long, torch.int, torch.int32, torch.int64]:
-            raise ValueError(f"Data must contain integer token IDs, got dtype {self.data.dtype}")
-
-        self.seq_len = seq_len
-        print(f"  Data shape after loading: {self.data.shape}")
-        print(f"  Loaded {len(self.data)} tokens")
-        print(f"  Number of sequences: {len(self)}")
-
-    def __len__(self):
-        return max(1, (len(self.data) - 1) // self.seq_len)
-
-    def __getitem__(self, idx):
-        start = idx * self.seq_len
-        end = start + self.seq_len + 1
-        if end > len(self.data):
-            end = len(self.data)
-            start = max(0, end - self.seq_len - 1)
-
-        chunk = self.data[start:end]
-        x = chunk[:-1]
-        y = chunk[1:]
-
-        if len(x) < self.seq_len:
-            pad = self.seq_len - len(x)
-            x = torch.cat([x, torch.zeros(pad, dtype=torch.long)])
-            y = torch.cat([y, torch.zeros(pad, dtype=torch.long)])
-
-        assert x.dim() == 1 and y.dim() == 1 and len(x) == self.seq_len
+    def __getitem__(self, idx: int):
+        if self.flat:
+            start = idx * self.seq_len
+            chunk = self.data[start : start + self.seq_len + 1]
+            x = chunk[:-1].long()
+            y = chunk[1:].long()
+        else:
+            row = self.data[idx].long()
+            x = row[:-1]
+            y = row[1:]
         return x, y
 
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.1):
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-    return LambdaLR(optimizer, lr_lambda)
+# ---------------------------------------------------------------------------
+# Learning-rate schedule: linear warmup → cosine decay
+# ---------------------------------------------------------------------------
+
+def get_lr(step: int, warmup_steps: int, max_steps: int, lr: float) -> float:
+    """Linearly warm up then cosine-decay to lr/10."""
+    if step < warmup_steps:
+        return lr * (step + 1) / warmup_steps
+    if step >= max_steps:
+        return lr / 10.0
+    progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr / 10.0 + cosine * (lr - lr / 10.0)
 
 
-def train_step(model, batch, device, scaler, accumulation_steps, use_fp16):
-    """
-    Perform forward/backward for one micro-batch (does NOT step optimizer).
-    Returns the scalar (unscaled) loss for logging.
-    """
-    input_ids, target_ids = batch
-
-    # If single-sample (1D), ensure batch dim
-    if input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-        target_ids = target_ids.unsqueeze(0)
-
-    input_ids = input_ids.to(device)
-    target_ids = target_ids.to(device)
-
-    if use_fp16 and scaler is not None:
-        with torch.cuda.amp.autocast():
-            logits = model(input_ids)
-            logits = logits.view(-1, logits.size(-1))
-            targets = target_ids.view(-1)
-            loss = nn.functional.cross_entropy(logits, targets, ignore_index=0)
-            loss = loss / accumulation_steps
-        scaler.scale(loss).backward()
-        return loss.item() * accumulation_steps
-    else:
-        logits = model(input_ids)
-        logits = logits.view(-1, logits.size(-1))
-        targets = target_ids.view(-1)
-        loss = nn.functional.cross_entropy(logits, targets, ignore_index=0)
-        loss = loss / accumulation_steps
-        loss.backward()
-        return loss.item() * accumulation_steps
-
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def validate(model, val_loader, device):
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_fp16: bool,
+    max_batches: int = 50,
+) -> tuple[float, float]:
+    """Return (avg_loss, perplexity) over up to `max_batches` val batches."""
     model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    for x, y in val_loader:
-        x = x.to(device)
-        y = y.to(device)
-        logits = model(x)
-        logits = logits.view(-1, logits.size(-1))
-        targets = y.view(-1)
-        loss = nn.functional.cross_entropy(logits, targets, reduction='sum', ignore_index=0)
-        nonpad = (targets != 0).sum().item()
+    total_loss, n_batches = 0.0, 0
+
+    for x, y in loader:
+        if n_batches >= max_batches:
+            break
+        x, y = x.to(device), y.to(device)
+
+        with torch.autocast(device_type=device.type, enabled=use_fp16):
+            logits = model(x)                               # (B, S, V)
+            B, S, V = logits.shape
+            loss = nn.functional.cross_entropy(
+                logits.reshape(B * S, V),
+                y.reshape(B * S),
+                ignore_index=-100,
+            )
+
         total_loss += loss.item()
-        total_tokens += nonpad
-    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
-    perplexity = math.exp(avg_loss) if avg_loss < 100 else float('inf')
+        n_batches  += 1
+
+    avg_loss = total_loss / max(1, n_batches)
+    perplexity = math.exp(min(avg_loss, 20))   # cap to avoid overflow
     model.train()
     return avg_loss, perplexity
 
 
-def save_checkpoint(model, optimizer, scheduler, step, args, filepath='checkpoint.pt'):
-    ckpt = {
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'step': step,
-        'args': vars(args),
-    }
-    torch.save(ckpt, filepath)
-    print(f"Checkpoint saved to {filepath}")
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler_state: dict,
+    step: int,
+    best_val_loss: float,
+) -> None:
+    torch.save(
+        {
+            "model_state":     model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler_state,
+            "step":            step,
+            "best_val_loss":   best_val_loss,
+        },
+        path,
+    )
+    print(f"  💾  Checkpoint saved → {path}")
 
 
-def load_checkpoint(filepath, model, optimizer, scheduler, device):
-    print(f"Loading checkpoint from {filepath}...")
-    ckpt = torch.load(filepath, map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
-    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-    start_step = ckpt.get('step', 0)
-    print(f"Resumed from step {start_step}")
-    return start_step
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Train TinyGPT on next-token prediction.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Data
+    p.add_argument("--data-dir",    type=str, default="data/",
+                   help="Directory containing train_inputs.pt and val_inputs.pt")
+    p.add_argument("--seq-len",     type=int, default=128,
+                   help="Sequence length (used only if tensors are 1-D)")
+    p.add_argument("--batch-size",  type=int, default=8)
+    p.add_argument("--num-workers", type=int, default=0)
+
+    # Training duration
+    p.add_argument("--max-steps",   type=int, default=5000,
+                   help="Stop after this many optimiser steps")
+    p.add_argument("--epochs",      type=int, default=None,
+                   help="Stop after this many epochs (whichever comes first with --max-steps)")
+
+    # Optimiser / schedule
+    p.add_argument("--lr",          type=float, default=1e-3)
+    p.add_argument("--weight-decay",type=float, default=0.01)
+    p.add_argument("--warmup-steps",type=int,   default=100)
+    p.add_argument("--accum-steps", type=int,   default=4,
+                   help="Gradient accumulation steps")
+    p.add_argument("--clip-grad",   type=float, default=1.0,
+                   help="Gradient norm clip value (0 = disabled)")
+
+    # Model
+    p.add_argument("--num-layers",  type=int, default=4)
+    p.add_argument("--d-model",     type=int, default=128)
+    p.add_argument("--d-ff",        type=int, default=512)
+    p.add_argument("--num-heads",   type=int, default=4)
+    p.add_argument("--dropout",     type=float, default=0.1)
+
+    # Misc
+    p.add_argument("--fp16",        action="store_true",
+                   help="Enable automatic mixed precision (AMP) if available")
+    p.add_argument("--out-dir",     type=str, default=".",
+                   help="Directory to write checkpoint.pt")
+    p.add_argument("--log-every",   type=int, default=100)
+    p.add_argument("--val-every",   type=int, default=500)
+    p.add_argument("--seed",        type=int, default=42)
+
+    return p.parse_args()
 
 
-def main(args):
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
     torch.manual_seed(args.seed)
+
+    # ── Device ───────────────────────────────────────────────────────────────
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"[device] Using {device}")
 
-    # device selection
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
-    print("Device:", device)
+    # FP16 only makes sense on CUDA
+    use_fp16 = args.fp16 and device.type == "cuda"
+    if args.fp16 and not use_fp16:
+        print("[warn] --fp16 requested but no CUDA device found; running in fp32")
 
-    use_fp16 = args.fp16 and device.type == 'cuda'
-    scaler = torch.cuda.amp.GradScaler() if use_fp16 else None
-    if use_fp16:
-        print("Mixed precision enabled (fp16)")
-
-    # data
+    # ── Load data ─────────────────────────────────────────────────────────────
     data_dir = Path(args.data_dir)
-    train_path = data_dir / 'train_inputs.pt'
-    val_path = data_dir / 'val_inputs.pt'
-    try:
-        train_ds = TokenDataset(train_path, seq_len=args.seq_len)
-        val_ds = TokenDataset(val_path, seq_len=args.seq_len)
-    except FileNotFoundError as e:
-        print(e)
-        return
+    train_path = data_dir / "train_inputs.pt"
+    val_path   = data_dir / "val_inputs.pt"
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=(device.type == 'cuda'))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=(device.type == 'cuda'))
+    for p in (train_path, val_path):
+        if not p.exists():
+            print(
+                f"[error] Dataset file not found: {p}\n"
+                f"        Run data_prep.py first, or point --data-dir to the "
+                f"directory containing train_inputs.pt and val_inputs.pt."
+            )
+            sys.exit(1)
 
-    print(f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
+    print(f"[data]  Loading {train_path} …", end=" ", flush=True)
+    train_data = torch.load(train_path, map_location="cpu", weights_only=True)
+    print(f"shape={tuple(train_data.shape)}")
 
-    # model
+    print(f"[data]  Loading {val_path} …", end=" ", flush=True)
+    val_data = torch.load(val_path, map_location="cpu", weights_only=True)
+    print(f"shape={tuple(val_data.shape)}")
+
+    train_ds = TokenDataset(train_data, seq_len=args.seq_len)
+    val_ds   = TokenDataset(val_data,   seq_len=args.seq_len)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    # Infer vocab_size from the data (max token + 1)
+    vocab_size = int(train_data.max().item()) + 1
+    print(f"[data]  Vocab size inferred from data : {vocab_size:,}")
+    print(f"[data]  Train samples : {len(train_ds):,}  |  Val samples : {len(val_ds):,}")
+
+    # ── Model ─────────────────────────────────────────────────────────────────
     model = TinyGPT(
         num_layers=args.num_layers,
-        vocab_size=args.vocab_size,
+        vocab_size=vocab_size,
         d_model=args.d_model,
         num_heads=args.num_heads,
         d_ff=args.d_ff,
-        max_len=args.seq_len,
-        dropout=args.dropout
+        dropout=args.dropout,
     ).to(device)
-    total_params = count_parameters(model)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    print("\n[model] TinyGPT architecture summary")
+    print(f"        Layers={args.num_layers}, d_model={args.d_model}, "
+          f"heads={args.num_heads}, d_ff={args.d_ff}")
+    n_params = count_parameters(model)
 
-    # total steps (step-driven)
-    total_steps = int(args.max_steps)
-    if total_steps <= 0:
-        raise ValueError("max_steps must be > 0 for step-driven training")
+    # ── Optimiser ─────────────────────────────────────────────────────────────
+    # Separate weight-decay params (matrices) from non-decay (biases, norms)
+    decay_params     = [p for n, p in model.named_parameters()
+                        if p.requires_grad and p.ndim >= 2]
+    no_decay_params  = [p for n, p in model.named_parameters()
+                        if p.requires_grad and p.ndim < 2]
 
-    scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, total_steps)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params,    "weight_decay": args.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
 
-    # resume from checkpoint (start_step must be known before printing config)
-    start_step = 0
-    if args.resume and os.path.exists(args.resume):
-        start_step = load_checkpoint(args.resume, model, optimizer, scheduler, device)
+    # LambdaLR wrapping our custom schedule
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: get_lr(step, args.warmup_steps, args.max_steps, 1.0),
+    )
 
-    print("\nTraining configuration:")
-    print(f"  Target steps: {total_steps}")
-    print(f"  Batches per data pass: {len(train_loader)}")
-    steps_per_pass = max(1, len(train_loader) // max(1, args.accum_steps))
-    print(f"  Steps per data pass (after accumulation): {steps_per_pass}")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Accumulation steps: {args.accum_steps}")
-    print(f"  Effective batch size: {args.batch_size * args.accum_steps}")
-    print(f"  Learning rate: {args.lr}")
-    print(f"  Weight decay: {args.weight_decay}")
-    print(f"  Warmup steps: {args.warmup_steps}")
-    print(f"  Starting from step: {start_step}")
-    print(f"  Total model params: {total_params:,}")
+    # AMP scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
 
-    # training state
+    # ── Training ──────────────────────────────────────────────────────────────
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    step           = 0
+    epoch          = 0
+    best_val_loss  = float("inf")
+    running_loss   = 0.0
+    accum_count    = 0
+    start_time     = time.time()
+
+    max_epochs = args.epochs if args.epochs is not None else 10**9
+
+    print(f"\n[train] Starting — max_steps={args.max_steps}, "
+          f"max_epochs={args.epochs or '∞'}, "
+          f"accum_steps={args.accum_steps}, fp16={use_fp16}\n")
+
     model.train()
-    global_step = int(start_step)
-    micro_step = 0  # counts microbatches since last optimizer step
-    accumulated_loss = 0.0
+    optimizer.zero_grad()
 
-    pbar = tqdm(total=total_steps, initial=global_step, desc="Training")
+    pbar = tqdm(total=args.max_steps, desc="Training", unit="step", dynamic_ncols=True)
 
-    # iterate over dataloader repeatedly until we hit total_steps
-    train_iter = iter(train_loader)
-    data_pass = 0
+    try:
+        while epoch < max_epochs and step < args.max_steps:
+            epoch += 1
 
-    while global_step < total_steps:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            # restart the iterator
-            train_iter = iter(train_loader)
-            data_pass += 1
-            # continue to next micro-batch
-            batch = next(train_iter)
+            for x, y in train_loader:
+                if step >= args.max_steps:
+                    break
 
-        # forward & backward for micro-batch
-        loss = train_step(model, batch, device, scaler, args.accum_steps, use_fp16)
-        accumulated_loss += loss
-        micro_step += 1
+                x, y = x.to(device), y.to(device)
 
-        # perform optimizer step every accumulation_steps micro-batches
-        if micro_step % args.accum_steps == 0:
-            # unscale & clip & step
-            if use_fp16 and scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                # ── Forward ──────────────────────────────────────────────────
+                with torch.autocast(device_type=device.type, enabled=use_fp16):
+                    logits = model(x)                         # (B, S, V)
+                    B, S, V = logits.shape
+                    loss = nn.functional.cross_entropy(
+                        logits.reshape(B * S, V),
+                        y.reshape(B * S),
+                        ignore_index=-100,
+                    )
+                    loss = loss / args.accum_steps            # scale for accumulation
+
+                # ── Backward ─────────────────────────────────────────────────
+                scaler.scale(loss).backward()
+                running_loss += loss.item() * args.accum_steps   # un-scale for logging
+                accum_count  += 1
+
+                if accum_count < args.accum_steps:
+                    continue  # accumulate more gradients
+
+                # ── Optimiser step ───────────────────────────────────────────
+                if args.clip_grad > 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+
                 scaler.step(optimizer)
                 scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
 
-            scheduler.step()
-            optimizer.zero_grad()
+                step        += 1
+                accum_count  = 0
+                avg_loss     = running_loss / args.log_every \
+                               if step % args.log_every != 0 \
+                               else running_loss / args.log_every
 
-            global_step += 1
-            pbar.update(1)
+                pbar.update(1)
+                pbar.set_postfix(
+                    loss=f"{loss.item() * args.accum_steps:.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                    step=step,
+                )
 
-            current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else args.lr
+                # ── Logging ──────────────────────────────────────────────────
+                if step % args.log_every == 0:
+                    elapsed  = time.time() - start_time
+                    avg      = running_loss / args.log_every
+                    print(
+                        f"\n  step {step:>6} | "
+                        f"train_loss {avg:.4f} | "
+                        f"lr {scheduler.get_last_lr()[0]:.2e} | "
+                        f"{elapsed:.1f}s elapsed"
+                    )
+                    running_loss = 0.0
 
-            # logging
-            if args.log_interval > 0 and (global_step % args.log_interval == 0 or args.log_interval == 1):
-                avg_loss = accumulated_loss / max(1, args.log_interval)
-                print(f"[Step {global_step}/{total_steps}] loss={loss:.4f} avg_loss={avg_loss:.4f} lr={current_lr:.2e}")
-                # reset accumulated_loss only when we used it for averaging
-                if args.log_interval != 0:
-                    accumulated_loss = 0.0
+                # ── Validation ───────────────────────────────────────────────
+                if step % args.val_every == 0:
+                    val_loss, ppl = evaluate(model, val_loader, device, use_fp16)
+                    is_best = val_loss < best_val_loss
+                    if is_best:
+                        best_val_loss = val_loss
+                    print(
+                        f"  ── val @ step {step} ── "
+                        f"val_loss {val_loss:.4f} | "
+                        f"perplexity {ppl:.2f}"
+                        + (" ← best" if is_best else "")
+                    )
+                    model.train()
 
-            # validation & optional checkpointing
-            if args.val_interval > 0 and (global_step % args.val_interval == 0):
-                val_loss, perplexity = validate(model, val_loader, device)
-                print(f"\nValidation @ step {global_step}: loss={val_loss:.4f}, ppl={perplexity:.2f}\n")
-                if args.save_best:
-                    save_checkpoint(model, optimizer, scheduler, global_step, args,
-                                    filepath=f"checkpoint_step_{global_step}.pt")
-
-            # reset micro_step after optimizer step
-            micro_step = 0
-
-        # end while loop - continue until global_step >= total_steps
+    except KeyboardInterrupt:
+        print("\n[train] Interrupted by user.")
 
     pbar.close()
 
-    # final validation and checkpoint
-    print("\nTraining finished — running final validation...")
-    val_loss, perplexity = validate(model, val_loader, device)
-    print(f"Final Validation - Loss: {val_loss:.4f}, Perplexity: {perplexity:.2f}")
+    # ── Final validation ──────────────────────────────────────────────────────
+    print("\n[eval]  Running final validation …")
+    val_loss, ppl = evaluate(model, val_loader, device, use_fp16)
+    print(f"        Final val_loss={val_loss:.4f}  perplexity={ppl:.2f}")
 
-    save_checkpoint(model, optimizer, scheduler, global_step, args, args.checkpoint_path)
-    print(f"Saved final checkpoint to {args.checkpoint_path}")
+    # ── Save checkpoint ───────────────────────────────────────────────────────
+    ckpt_path = out_dir / "checkpoint.pt"
+    save_checkpoint(
+        path=ckpt_path,
+        model=model,
+        optimizer=optimizer,
+        scheduler_state=scheduler.state_dict(),
+        step=step,
+        best_val_loss=best_val_loss,
+    )
+
+    elapsed = time.time() - start_time
+    print(f"\n[done]  {step} optimiser steps in {elapsed:.1f}s  "
+          f"({step / max(elapsed, 1):.1f} steps/s)")
+    print(f"        Checkpoint → {ckpt_path.resolve()}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train TinyGPT language model (step-driven)")
-
-    # Data args
-    parser.add_argument('--data-dir', type=str, default='data/', help='Directory containing train_inputs.pt and val_inputs.pt')
-    parser.add_argument('--seq-len', type=int, default=128, help='Maximum sequence length')
-
-    # Model args
-    parser.add_argument('--num-layers', type=int, default=4, help='Number of transformer layers')
-    parser.add_argument('--vocab-size', type=int, default=50257, help='Vocabulary size')
-    parser.add_argument('--d-model', type=int, default=128, help='Model dimension')
-    parser.add_argument('--num-heads', type=int, default=4, help='Number of attention heads')
-    parser.add_argument('--d-ff', type=int, default=512, help='Feed-forward dimension')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout probability')
-
-    # Training args (step-driven)
-    parser.add_argument('--batch-size', type=int, default=8, help='Batch size per GPU')
-    parser.add_argument('--accum-steps', type=int, default=4, help='Gradient accumulation steps (microbatches per optimizer step)')
-    parser.add_argument('--max-steps', type=int, default=5000, help='Maximum number of optimizer steps to run (required)')
-
-    # Optimizer / LR
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=0.01, help='Weight decay')
-    parser.add_argument('--warmup-steps', type=int, default=100, help='Number of warmup steps')
-    parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping value')
-
-    # Logging/checkpoint
-    parser.add_argument('--log-interval', type=int, default=1, help='Print training logs every N steps (1 = every step)')
-    parser.add_argument('--val-interval', type=int, default=500, help='Run validation every N steps (0 = never)')
-    parser.add_argument('--checkpoint-path', type=str, default='checkpoint.pt', help='Path to save final checkpoint')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--save-best', action='store_true', help='Save checkpoint at each validation step')
-
-    # System
-    parser.add_argument('--no-cuda', action='store_true', help='Disable CUDA even if available')
-    parser.add_argument('--fp16', action='store_true', help='Use mixed precision training (CUDA only)')
-    parser.add_argument('--num-workers', type=int, default=0, help='Dataloader worker count')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-
-    args = parser.parse_args()
-    main(args)
+    main()

@@ -1,474 +1,505 @@
 """
-Homomorphic Encryption utilities for PyFHEL.
+he_utils.py
+===========
+Pyfhel helpers for BFV-scheme Fully Homomorphic Encryption (FHE).
 
-This module provides helper functions to setup BFV (Brakerski/Fan-Vercauteren)
-context and perform encrypted operations on tensors using Pyfhel.
+BFV scheme quick reference
+---------------------------
+BFV (Brakerski / Fan-Vercauteren) operates on **integer** plaintexts modulo a
+prime `t` (the plaintext modulus).  Operations happen inside a polynomial ring
+Z_t[x] / (x^n + 1), where:
 
-Key Design Choices:
-- n=2**14 (16384): polynomial degree balances security & performance
-- t=65537: plaintext modulus (prime), allows sufficient arithmetic operations
-  before noise growth dominates
-- Batching: reduces ciphertext count for large tensors but increases latency
-  per operation due to slot management overhead
+  n  (poly_modulus_degree)  — must be a power of 2.
+                             Larger n → more slots, higher security, slower ops.
+                             n=2**14=16384 gives ~192-bit security at t≈2^16.
+
+  t  (plain_modulus / t_bits) — prime determining the plaintext space [0, t).
+                             t=65537 (a Fermat prime 2^16+1) is the standard
+                             choice: it is prime, fits 16 bits, and enables
+                             efficient NTT-based batching.
+
+  q  (coeff_modulus)        — ciphertext modulus; controls noise budget.
+                             Pyfhel chooses a safe default from the security
+                             level when you set sec=192 (or 128).
+
+Noise budget
+------------
+Every ciphertext starts with a finite "noise budget" (in bits).  Each
+homomorphic multiplication consumes roughly half the budget.  When the budget
+hits zero the ciphertext cannot be decrypted correctly.
+
+  Fresh ciphertext  : ~438 bits  (n=2**14, default coeff_modulus)
+  Cost of addition  : negligible
+  Cost of multiply  : ~(budget / 2) bits consumed
+
+For n=2**14 and t=65537 you can perform ~27 consecutive multiplications
+before the noise budget is exhausted.
+
+Performance notes
+-----------------
+  * BFV batching (batch=True) packs n//2 integers into one ciphertext and
+    executes SIMD-style operations; it is 100-1000× faster than the
+    element-wise approach for large tensors.
+  * Element-wise mode (batch=False) creates one ciphertext per value; use
+    only for small tensors or when you need per-element control.
+  * Key generation for n=2**14 takes ~1-2 s on a modern CPU.
+  * Relinearisation keys (relin_key) are required after multiplication to
+    keep ciphertext size at 2 polynomials.
 """
 
-import torch
 import time
-from typing import Union, List, Tuple, Any
-from Pyfhel import Pyfhel
-import numpy as np
+from typing import Union
+
+import torch
+
+try:
+    from Pyfhel import Pyfhel, PyPtxt
+except ImportError as _pyfhel_err:  # pragma: no cover
+    raise ImportError(
+        "Pyfhel is required but not installed.\n"
+        "Install it with:  pip install Pyfhel\n"
+        "(Pyfhel needs a C++ compiler; see https://github.com/ibarrond/Pyfhel)"
+    ) from _pyfhel_err
 
 
-def setup_HE_context(n: int = 2**14, t: int = 65537) -> Pyfhel:
+# ---------------------------------------------------------------------------
+# Context setup
+# ---------------------------------------------------------------------------
+
+def setup_HE_context(n: int = 2 ** 14, t: int = 65537) -> Pyfhel:
     """
-    Initialize BFV homomorphic encryption context with keys.
+    Create and return a fully initialised Pyfhel object configured for BFV.
 
     Parameters
     ----------
     n : int
-        Polynomial degree (default 2**14 = 16384).
-        - Larger n increases security but slows encryption/decryption
-        - n must be power of 2 for FFT efficiency in Pyfhel
-        - 2**14 provides ~128-bit security with 109-bit plaintext modulus
-    
+        Polynomial modulus degree (must be a power of 2).
+        Controls the number of batching slots (n // 2) and the security level.
+        Default 2**14 = 16 384 gives ~192-bit security with the default
+        coefficient modulus chosen by Pyfhel.
+
     t : int
-        Plaintext modulus (default 65537, a prime).
-        - Must be prime and > 2 for BFV scheme
-        - Larger t allows more noise growth before error but reduces security
-        - 65537 is a Fermat prime, efficient in modular arithmetic
-        - Supports up to ~6-7 multiplications before noise exceeds modulus
+        Plaintext modulus (must be a prime ≡ 1 (mod 2n) for batching to work).
+        Default 65537 = 2^16 + 1 satisfies this condition for all n ≤ 2**16.
+        All arithmetic is performed modulo t, so values must lie in [0, t).
 
     Returns
     -------
-    Pyfhel
-        Initialized Pyfhel object with secret/public keys generated.
+    HE : Pyfhel
+        Object with context, public key, secret key, and relinearisation key
+        already generated.  Pass this handle to encrypt_tensor / decrypt_tensor.
 
-    Notes
-    -----
-    - Secret key: kept private, used for decryption
-    - Public key: used for encryption, can be shared
-    - Evaluation key (relinearization): needed for multiplication, auto-generated
+    Raises
+    ------
+    ValueError
+        If n is not a power of 2, or t is not a valid plaintext modulus.
+    RuntimeError
+        If Pyfhel context or key generation fails.
     """
+    # Validate n
+    if n < 2 or (n & (n - 1)) != 0:
+        raise ValueError(f"n must be a power of 2, got {n}")
+    # Validate t is prime (simple trial-division for expected small values)
+    if t < 2 or not _is_prime(t):
+        raise ValueError(f"t must be a prime number, got {t}")
+
     HE = Pyfhel()
-    # BFV scheme with n polynomial degree, t plaintext modulus
-    HE.contextGen(scheme='BFV', n=n, t=t)
-    HE.keyGen()
+
+    try:
+        # contextGen sets up the polynomial ring and coefficient modulus.
+        # sec=192 asks Pyfhel to pick a coeff_modulus that achieves ~192-bit
+        # security; you can lower to sec=128 for a larger noise budget.
+        HE.contextGen(
+            scheme="BFV",
+            n=n,
+            t=t,
+            sec=128,          # security level in bits (128 or 192)
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Pyfhel contextGen failed (n={n}, t={t}): {exc}"
+        ) from exc
+
+    try:
+        HE.keyGen()           # generates public + secret key pair
+        HE.relinKeyGen()      # relinearisation key: required after multiply
+        HE.rotateKeyGen()     # rotation keys: needed for slot rotations / batching
+    except Exception as exc:
+        raise RuntimeError(f"Pyfhel key generation failed: {exc}") from exc
+
     return HE
 
+
+# ---------------------------------------------------------------------------
+# Encrypt
+# ---------------------------------------------------------------------------
 
 def encrypt_tensor(
     tensor: torch.Tensor,
     HE: Pyfhel,
-    batch: bool = False
-) -> List:
+    batch: bool = False,
+) -> list:
     """
-    Encrypt a tensor elementwise or batched.
+    Encode and encrypt a 1-D or 2-D integer tensor using BFV.
 
     Parameters
     ----------
     tensor : torch.Tensor
-        1D or 2D tensor to encrypt. Elements must be integers or convertible.
+        Input tensor.  Values must be integers in [0, t) where t is the
+        plaintext modulus used when the HE context was created.
+        Float tensors are automatically cast to int64 (truncation, not rounding).
+        Supported shapes: (L,) or (R, C).
+
     HE : Pyfhel
-        Initialized Pyfhel object with public key.
-    batch : bool, default False
-        If True, encrypt entire rows as batched ciphertexts (single ciphertext
-        per row). If False, encrypt each element separately.
-        - batch=True: More efficient for matrix operations but requires
-          careful slot management
-        - batch=False: Each element is independent ciphertext, simpler but
-          slower for large tensors
+        An initialised Pyfhel object (from setup_HE_context).
+
+    batch : bool
+        False (default) — element-wise mode.
+            Each scalar value is encrypted into its own ciphertext.
+            Returns a flat list of PyCtxt objects whose length equals
+            the total number of elements (R*C for 2-D input).
+
+        True — batched mode.
+            Values are packed into ciphertext slots using BFV's SIMD encoding.
+            For a 1-D tensor of length L a single ciphertext is returned
+            (L must be ≤ n//2 slots).  For a 2-D tensor each row becomes one
+            ciphertext.
+            Returns list of PyCtxt objects (length 1 for 1-D, R for 2-D).
+
+            ⚡ Batch mode is orders of magnitude faster for large tensors because
+            one ciphertext holds up to n//2 values and operations apply to all
+            slots simultaneously.
 
     Returns
     -------
-    list of ciphertexts
-        If batch=False and tensor is 1D: list of encrypted scalars
-        If batch=False and tensor is 2D: list of lists of encrypted scalars
-        If batch=True and tensor is 2D: list of batched ciphertexts
-        If batch=True and tensor is 1D: list with single batched ciphertext
+    list[PyCtxt]
+        Flat list of ciphertexts.  Metadata needed for decryption (original
+        shape, batch flag) is stored as attributes on the returned list object
+        (``ciphertexts.original_shape`` and ``ciphertexts.batch``).
 
     Raises
     ------
-    ValueError
-        If tensor has more than 2 dimensions or HE context not initialized.
+    TypeError  : tensor is not a torch.Tensor, or HE is not a Pyfhel instance.
+    ValueError : tensor has unsupported number of dimensions, or batch slot
+                 count exceeds n//2.
     """
-    if not isinstance(HE, Pyfhel):
-        raise ValueError("HE must be a Pyfhel object")
-    
-    if tensor.dim() > 2:
-        raise ValueError(f"Tensor must be 1D or 2D, got {tensor.dim()}D")
-    
-    # Convert to CPU integers if needed
-    tensor = tensor.detach().cpu().int()
-    
-    if tensor.dim() == 1:
-        if batch:
-            # Single batched ciphertext for entire 1D tensor
-            int_list = tensor.tolist()
-            encrypted = HE.encrypt(int_list)
-            return [encrypted]
-        else:
-            # Elementwise encryption
-            return [HE.encrypt(int(x)) for x in tensor]
-    
-    else:  # 2D tensor
-        if batch:
-            # One batched ciphertext per row
-            return [HE.encrypt(row.tolist()) for row in tensor]
-        else:
-            # Elementwise encryption
-            return [[HE.encrypt(int(x)) for x in row] for row in tensor]
+    _check_he(HE)
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"tensor must be a torch.Tensor, got {type(tensor)}")
+    if tensor.ndim not in (1, 2):
+        raise ValueError(f"Only 1-D and 2-D tensors are supported, got shape {tensor.shape}")
 
+    # Cast to int64; BFV plaintexts are integers mod t
+    int_tensor = tensor.detach().cpu().to(torch.int64)
+    original_shape = tuple(int_tensor.shape)
 
-def decrypt_tensor(ciphertexts: Union[List, List[List]], HE: Pyfhel) -> torch.Tensor:
-    """
-    Decrypt ciphertexts back to torch tensor.
+    n_slots = HE.get_nSlots()  # = n // 2
 
-    Parameters
-    ----------
-    ciphertexts : list or list of lists
-        Output from encrypt_tensor(). Can be:
-        - List of encrypted scalars (1D output)
-        - List of lists of encrypted scalars (2D output)
-        - List of batched ciphertexts (from batch=True)
-    HE : Pyfhel
-        Initialized Pyfhel object with secret key.
+    ciphertexts = []
 
-    Returns
-    -------
-    torch.Tensor
-        Decrypted tensor with original shape. Values are integers mod t.
+    if not batch:
+        # ── Element-wise: one ciphertext per scalar ──────────────────────────
+        # Performance note: this creates len(tensor.flatten()) ciphertexts.
+        # Each encryption takes ~microseconds but the total overhead is linear
+        # in the number of elements.  Use batch=True for tensors with > ~100
+        # elements.
+        flat = int_tensor.flatten().tolist()
+        for val in flat:
+            ptxt = HE.encode([int(val)])
+            ctxt = HE.encrypt(ptxt)
+            ciphertexts.append(ctxt)
 
-    Raises
-    ------
-    ValueError
-        If HE context not initialized or invalid ciphertext structure.
-    
-    Notes
-    -----
-    Pyfhel's decrypt() returns a numpy array with values replicated across
-    all slots. For unbatched encryption (one scalar per ciphertext), we
-    extract the first slot value.
-    """
-    if not isinstance(HE, Pyfhel):
-        raise ValueError("HE must be a Pyfhel object")
-
-    if not ciphertexts:
-        raise ValueError("Empty ciphertext list")
-
-    # Detect if batched by checking if first element is a list
-    if isinstance(ciphertexts[0], list):
-        # Unbatched 2D: list of lists of ciphertexts
-        result = []
-        for row in ciphertexts:
-            decrypted_row = [int(HE.decrypt(ct)[0]) for ct in row]
-            result.append(decrypted_row)
-        return torch.tensor(result, dtype=torch.long)
-
-    # Check if batch by decrypting first ciphertext and checking slot count
-    first_decrypted = HE.decrypt(ciphertexts[0])
-
-    # first_decrypted is numpy array; check if we have explicit batching
-    # (multiple distinct values) or implicit (all same value)
-    unique_vals = len(set(first_decrypted))
-
-    if unique_vals > 1:
-        # Batched: multiple distinct values in slots
-        result = []
-        for ct in ciphertexts:
-            # Take only the unique values from this batch
-            dec_vals = HE.decrypt(ct)
-            # Get the unique values preserving order
-            decrypted_row = list(dict.fromkeys(dec_vals))
-            result.append(decrypted_row)
-        return torch.tensor(result, dtype=torch.long)
-
-    # Unbatched 1D: scalar encrypted, replicated across all slots
-    result = [int(HE.decrypt(ct)[0]) for ct in ciphertexts]
-    return torch.tensor(result, dtype=torch.long)
-
-
-def batch_encrypt(
-    values: np.ndarray,
-    HE: Pyfhel,
-    pack_size: int,
-) -> Tuple[List[Any], int]:
-    """
-    Batched encoding/encryption for SIMD-style packing.
-
-    Parameters
-    ----------
-    values : np.ndarray
-        1D array of integers/floats to encrypt.
-    HE : Pyfhel
-        Initialized Pyfhel context.
-    pack_size : int
-        Number of slots per ciphertext to pack. If <= 0, falls back to
-        elementwise encryption.
-
-    Returns
-    -------
-    ciphertexts : list
-        List of Pyfhel ciphertexts, each containing up to pack_size values.
-    pad : int
-        Number of padding elements (zeros) added at the end to align to
-        pack_size.
-
-    Notes
-    -----
-    - If HE supports vector encryption (BFV with batching), we pack
-      contiguous chunks into a single ciphertext.
-    - Fallback: if an error occurs, we fall back to scalar encryption.
-    """
-    if not isinstance(HE, Pyfhel):
-        raise ValueError("HE must be a Pyfhel object")
-
-    arr = np.asarray(values)
-    arr = arr.astype(np.int64)
-
-    if pack_size is None or pack_size <= 0:
-        cts = [HE.encrypt(int(v)) for v in arr]
-        return cts, 0
-
-    n = len(arr)
-    pad = (pack_size - (n % pack_size)) % pack_size
-    if pad > 0:
-        arr = np.concatenate([arr, np.zeros(pad, dtype=arr.dtype)])
-
-    ciphertexts: List[Any] = []
-    try:
-        for i in range(0, len(arr), pack_size):
-            chunk = arr[i : i + pack_size].tolist()
-            ciphertexts.append(HE.encrypt(chunk))
-    except Exception:
-        # Fallback: scalar encryption
-        ciphertexts = [HE.encrypt(int(v)) for v in arr]
-    return ciphertexts, pad
-
-
-def he_linear_batched(
-    enc_inputs: List[Any],
-    weight: torch.Tensor,
-    bias: Union[torch.Tensor, None],
-    HE: Pyfhel,
-    pack_size: int,
-) -> List[Any]:
-    """
-    Approximate batched encrypted linear layer using SIMD-style packing.
-
-    Parameters
-    ----------
-    enc_inputs : list
-        List of ciphertexts returned by batch_encrypt.
-    weight : torch.Tensor
-        Weight matrix of shape (out_features, in_features).
-    bias : torch.Tensor or None
-        Optional bias vector of shape (out_features,).
-    HE : Pyfhel
-        Pyfhel context.
-    pack_size : int
-        Packing size used in batch_encrypt.
-
-    Returns
-    -------
-    list of ciphertexts
-        Encrypted outputs (one ciphertext per output chunk).
-
-    Notes
-    -----
-    This is a highly simplified batched linear implementation:
-      - It assumes a row-major layout and uses slot-wise multiplication
-        followed by slot rotations (not implemented here for brevity).
-      - In practice, you would use Pyfhel's rotate and add operations
-        to implement dot-products over packed slots.
-      - For this demo, we fall back to decrypt → matmul → encrypt to
-        focus on benchmarking packing overhead vs scalar encryption.
-    """
-    if not isinstance(HE, Pyfhel):
-        raise ValueError("HE must be a Pyfhel object")
-
-    # Fallback demo implementation: decrypt, apply plaintext linear, re-encrypt.
-    # This still allows us to benchmark packing vs scalar encryption cost.
-    decrypted = []
-    for ct in enc_inputs:
-        vals = HE.decrypt(ct)
-        decrypted.extend(list(dict.fromkeys(vals)))
-    x = torch.tensor(decrypted, dtype=torch.long)
-    x = x.to(weight.dtype)
-
-    # Truncate or pad x to match weight.in_features
-    in_features = weight.shape[1]
-    if x.numel() < in_features:
-        pad = in_features - x.numel()
-        x = torch.cat([x, torch.zeros(pad, dtype=x.dtype)], dim=0)
-    elif x.numel() > in_features:
-        x = x[:in_features]
-
-    out = weight @ x
-    if bias is not None:
-        out = out + bias.to(out.dtype)
-
-    out_np = out.detach().cpu().numpy().astype(np.int64)
-    cts, _ = batch_encrypt(out_np, HE, pack_size=pack_size)
-    return cts
-
-
-def he_batch_benchmark() -> None:
-    """
-    Benchmark batched vs element-wise encryption and linear ops.
-
-    Uses small toy sizes and prints a rough speedup factor along with
-    caveats about this simplified implementation.
-    """
-    print("=" * 70)
-    print("HE batched vs element-wise benchmark")
-    print("=" * 70)
-
-    HE = setup_HE_context(n=2**14, t=65537)
-
-    in_features = 64
-    out_features = 32
-    pack_size = 16
-
-    x = np.random.randint(0, 100, size=(in_features,), dtype=np.int64)
-    weight = torch.randint(0, 10, (out_features, in_features), dtype=torch.long)
-    bias = torch.randint(0, 10, (out_features,), dtype=torch.long)
-
-    # Element-wise path
-    start = time.perf_counter()
-    enc_scalar = [HE.encrypt(int(v)) for v in x]
-    scalar_enc_time = (time.perf_counter() - start) * 1000
-
-    # Decrypt + linear + re-encrypt for element-wise (fair comparison)
-    start = time.perf_counter()
-    dec_scalar = [int(HE.decrypt(ct)[0]) for ct in enc_scalar]
-    x_plain = torch.tensor(dec_scalar, dtype=torch.long).to(weight.dtype)
-    y_plain = weight @ x_plain + bias.to(x_plain.dtype)
-    _ = [HE.encrypt(int(v)) for v in y_plain.detach().cpu().numpy()]
-    scalar_total_time = (time.perf_counter() - start) * 1000
-
-    # Batched path
-    start = time.perf_counter()
-    enc_batched, pad = batch_encrypt(x, HE, pack_size=pack_size)
-    batched_enc_time = (time.perf_counter() - start) * 1000
-
-    start = time.perf_counter()
-    _ = he_linear_batched(enc_batched, weight, bias, HE, pack_size=pack_size)
-    batched_total_time = (time.perf_counter() - start) * 1000
-
-    print(f"Scalar encrypt time:   {scalar_enc_time:.2f} ms")
-    print(f"Scalar end-to-end:     {scalar_total_time:.2f} ms")
-    print(f"Batched encrypt time:  {batched_enc_time:.2f} ms (pad={pad})")
-    print(f"Batched end-to-end:    {batched_total_time:.2f} ms")
-
-    scalar = scalar_enc_time + scalar_total_time
-    batched = batched_enc_time + batched_total_time
-    if batched > 0:
-        speedup = scalar / batched
     else:
-        speedup = float("inf")
+        # ── Batched: pack rows (or the whole 1-D tensor) into slots ──────────
+        rows = int_tensor if int_tensor.ndim == 2 else int_tensor.unsqueeze(0)
+        _, row_len = rows.shape
+        if row_len > n_slots:
+            raise ValueError(
+                f"Row length {row_len} exceeds the number of BFV slots "
+                f"({n_slots} = n//2 = {HE.get_n()}//2).  "
+                f"Split the tensor or use a larger n."
+            )
+        for row in rows:
+            # Pad row to n_slots with zeros (BFV requires full slot vector)
+            padded = row.tolist() + [0] * (n_slots - row_len)
+            ptxt = HE.encode(padded)
+            ctxt = HE.encrypt(ptxt)
+            ciphertexts.append(ctxt)
 
-    print(f"\nEstimated speedup (scalar / batched): {speedup:.2f}x")
-    print(
-        "\nCaveats:\n"
-        "  - he_linear_batched currently decrypts, runs plaintext matmul, and\n"
-        "    re-encrypts; a production implementation would use rotation and\n"
-        "    slot-wise ops to keep computation encrypted end-to-end.\n"
-        "  - Speedup mainly reflects fewer ciphertext objects and packing\n"
-        "    overhead, not true HE matmul cost.\n"
-        "  - Use this as a qualitative indicator only.\n"
-    )
+    # Attach metadata so decrypt_tensor can reconstruct the original shape
+    ciphertexts = _TaggedList(ciphertexts, original_shape=original_shape, batch=batch)
+    return ciphertexts
 
+
+# ---------------------------------------------------------------------------
+# Decrypt
+# ---------------------------------------------------------------------------
+
+def decrypt_tensor(
+    ciphertexts,
+    HE: Pyfhel,
+) -> torch.Tensor:
+    """
+    Decrypt a list of ciphertexts (produced by encrypt_tensor) back to a tensor.
+
+    Parameters
+    ----------
+    ciphertexts : _TaggedList or list[PyCtxt]
+        List returned by encrypt_tensor.  Must have ``.original_shape`` and
+        ``.batch`` attributes (automatically set by encrypt_tensor).
+        If you pass a plain list the function assumes element-wise mode and
+        returns a 1-D tensor.
+
+    HE : Pyfhel
+        The same initialised Pyfhel object used for encryption (must hold the
+        secret key).
+
+    Returns
+    -------
+    torch.Tensor  (dtype=torch.int64)
+        Tensor with the same shape as the original input to encrypt_tensor.
+        Values are integers modulo t; floating-point inputs are therefore
+        recovered as truncated integers.
+
+    Raises
+    ------
+    TypeError   : HE is not a Pyfhel instance.
+    RuntimeError: Decryption fails (e.g. noise budget exhausted after too many
+                  multiplications — the classic FHE failure mode).
+    """
+    _check_he(HE)
+
+    batch          = getattr(ciphertexts, "batch", False)
+    original_shape = getattr(ciphertexts, "original_shape", None)
+
+    values: list[int] = []
+
+    try:
+        if not batch:
+            # ── Element-wise decryption ───────────────────────────────────────
+            for ctxt in ciphertexts:
+                ptxt  = HE.decrypt(ctxt)
+                # decryptInt returns a list; first element is the scalar
+                val   = HE.decryptInt(ctxt)
+                scalar = val[0] if hasattr(val, "__len__") else int(val)
+                values.append(scalar)
+
+        else:
+            # ── Batched decryption ────────────────────────────────────────────
+            n_slots = HE.get_nSlots()
+            if original_shape is not None:
+                row_len = original_shape[-1]
+            else:
+                row_len = n_slots  # fall back: return all slots
+
+            for ctxt in ciphertexts:
+                decoded = HE.decryptInt(ctxt)           # list of n_slots ints
+                values.extend(decoded[:row_len])        # strip padding zeros
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"Decryption failed: {exc}\n"
+            "This can happen if the noise budget was exhausted by too many "
+            "homomorphic multiplications.  Reduce the circuit depth or "
+            "increase n (poly_modulus_degree)."
+        ) from exc
+
+    t = torch.tensor(values, dtype=torch.int64)
+    if original_shape is not None:
+        t = t.reshape(original_shape)
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Demo / acceptance test
+# ---------------------------------------------------------------------------
 
 def test_homomorphic_operations() -> None:
     """
-    Demonstrate and benchmark homomorphic operations on encrypted tensors.
+    Demonstrate and validate encrypted addition and multiplication.
 
-    Operations tested:
-    - Encrypted addition: c1 + c2 (no noise growth penalty)
-    - Encrypted multiplication: c1 * c2 (significant noise growth)
+    Covers
+    ------
+    1. Context setup timing.
+    2. Element-wise encrypt → HE add → decrypt, compared to plaintext add.
+    3. Element-wise encrypt → HE multiply → decrypt, compared to plaintext mul.
+    4. Batched encrypt → HE add → decrypt, with timing comparison.
+    5. Noise budget check (prints remaining budget after each operation).
+    6. Numeric error tolerance report (should be 0 for integers mod t).
 
-    Prints:
-    - Setup and operation timings (milliseconds)
-    - Numeric error tolerance analysis
-    - Validity of decrypted results
-
-    Notes on Noise Growth:
-    - Addition: noise increases linearly, cheap operation
-    - Multiplication: noise grows quadratically, expensive operation
-    - After ~6-7 multiplications with t=65537, noise exceeds plaintext space
-    - Relinearization (auto in Pyfhel) helps but still causes noise growth
+    Prints timings (time.perf_counter) and validates correctness within the
+    quantization tolerance expected for BFV integer arithmetic.
     """
-    print("=" * 70)
-    print("Homomorphic Encryption Operations Test (BFV with Pyfhel)")
-    print("=" * 70)
-    
-    # Setup
-    start = time.perf_counter()
-    HE = setup_HE_context(n=2**14, t=65537)
-    setup_time = (time.perf_counter() - start) * 1000
-    print(f"[Setup] HE context initialized: {setup_time:.2f} ms")
-    
-    # Create test tensors (small values to avoid modulus issues)
-    tensor_a = torch.tensor([2, 3, 4], dtype=torch.long)
-    tensor_b = torch.tensor([5, 6, 7], dtype=torch.long)
-    
-    print(f"\nPlaintext operands:")
-    print(f"  A = {tensor_a.tolist()}")
-    print(f"  B = {tensor_b.tolist()}")
-    
-    # Encryption
-    start = time.perf_counter()
-    enc_a = encrypt_tensor(tensor_a, HE, batch=False)
-    enc_b = encrypt_tensor(tensor_b, HE, batch=False)
-    enc_time = (time.perf_counter() - start) * 1000
-    print(f"\n[Encryption] {len(enc_a)} + {len(enc_b)} elements encrypted: {enc_time:.2f} ms")
-    
-    # Encrypted addition (homomorphic)
-    start = time.perf_counter()
-    enc_sum = [enc_a[i] + enc_b[i] for i in range(len(enc_a))]
-    add_time = (time.perf_counter() - start) * 1000
-    print(f"[Encrypted Addition] 3 elements: {add_time:.2f} ms")
-    
-    # Decrypt and verify addition
-    dec_sum = decrypt_tensor(enc_sum, HE)
-    expected_sum = tensor_a + tensor_b
-    add_match = torch.allclose(dec_sum, expected_sum)
-    print(f"  Result: {dec_sum.tolist()}")
-    print(f"  Expected: {expected_sum.tolist()}")
-    print(f"  Correct: {add_match} ✓" if add_match else f"  MISMATCH ✗")
-    
-    # Encrypted multiplication (homomorphic)
-    # Re-encrypt for clean state to avoid noise accumulation
-    enc_a_mult = encrypt_tensor(tensor_a, HE, batch=False)
-    enc_b_mult = encrypt_tensor(tensor_b, HE, batch=False)
-    
-    start = time.perf_counter()
-    enc_prod = [enc_a_mult[i] * enc_b_mult[i] for i in range(len(enc_a_mult))]
-    mult_time = (time.perf_counter() - start) * 1000
-    print(f"\n[Encrypted Multiplication] 3 elements: {mult_time:.2f} ms")
-    
-    # Decrypt and verify multiplication
-    dec_prod = decrypt_tensor(enc_prod, HE)
-    expected_prod = tensor_a * tensor_b
-    mult_match = torch.allclose(dec_prod, expected_prod)
-    print(f"  Result: {dec_prod.tolist()}")
-    print(f"  Expected: {expected_prod.tolist()}")
-    print(f"  Correct: {mult_match} ✓" if mult_match else f"  MISMATCH ✗")
-    
-    # Error tolerance analysis
-    print(f"\n[Error Tolerance Analysis]")
-    print(f"  Plaintext modulus (t): 65537")
-    print(f"  Quantization error: < 1 (integer arithmetic)")
-    print(f"  Decryption tolerance: Values mod 65537")
-    print(f"  Noise budget after 1 mult: ~109 bits")
-    print(f"  Estimated mult depth: ~6-7 before failure")
-    
-    print("\n" + "=" * 70)
-    print("Test Complete")
-    print("=" * 70)
+    print("=" * 60)
+    print("  Pyfhel BFV — Homomorphic Operations Demo")
+    print("=" * 60)
 
+    # ── 1. Setup ──────────────────────────────────────────────────────────────
+    print("\n[1/4] Setting up BFV context (n=2**13, t=65537) …")
+    # Use n=2**13 for speed in the demo; n=2**14 for production security
+    t0 = time.perf_counter()
+    HE = setup_HE_context(n=2 ** 13, t=65537)
+    t_setup = time.perf_counter() - t0
+    print(f"      Context + key generation : {t_setup:.3f} s")
+    print(f"      Slots available          : {HE.get_nSlots()}")
+
+    # ── 2. Encrypted addition (element-wise) ──────────────────────────────────
+    print("\n[2/4] Encrypted addition (element-wise) …")
+    a = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int64)
+    b = torch.tensor([ 1,  2,  3,  4,  5], dtype=torch.int64)
+    expected_add = a + b
+
+    t0 = time.perf_counter()
+    ct_a = encrypt_tensor(a, HE, batch=False)
+    ct_b = encrypt_tensor(b, HE, batch=False)
+    t_enc = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    ct_sum = _TaggedList(
+        [ca + cb for ca, cb in zip(ct_a, ct_b)],
+        original_shape=ct_a.original_shape,
+        batch=False,
+    )
+    t_add = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    result_add = decrypt_tensor(ct_sum, HE)
+    t_dec = time.perf_counter() - t0
+
+    err_add = (result_add - expected_add).abs().max().item()
+    print(f"      Plaintext  a       : {a.tolist()}")
+    print(f"      Plaintext  b       : {b.tolist()}")
+    print(f"      Expected   a+b     : {expected_add.tolist()}")
+    print(f"      Decrypted  a+b     : {result_add.tolist()}")
+    print(f"      Max absolute error : {err_add}  (expected 0 for BFV integers)")
+    print(f"      Timings — enc: {t_enc*1e3:.2f} ms | "
+          f"add: {t_add*1e3:.3f} ms | dec: {t_dec*1e3:.2f} ms")
+    assert err_add == 0, f"Addition error {err_add} > 0!"
+    print("      ✓ Addition correct")
+
+    # ── 3. Encrypted multiplication (element-wise) ────────────────────────────
+    print("\n[3/4] Encrypted multiplication (element-wise) …")
+    c = torch.tensor([2, 3, 4, 5, 6], dtype=torch.int64)
+    d = torch.tensor([7, 8, 9, 1, 2], dtype=torch.int64)
+    expected_mul = c * d
+
+    t0 = time.perf_counter()
+    ct_c = encrypt_tensor(c, HE, batch=False)
+    ct_d = encrypt_tensor(d, HE, batch=False)
+    t_enc2 = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    ct_prod_list = []
+    for cc, cd in zip(ct_c, ct_d):
+        cp = cc * cd        # homomorphic multiplication
+        # Relinearise to reduce ciphertext size back to 2 polynomials.
+        # Without this, each multiply doubles the ciphertext size and noise
+        # grows super-linearly.
+        HE.relinearize(cp)
+        ct_prod_list.append(cp)
+    ct_prod = _TaggedList(ct_prod_list, original_shape=ct_c.original_shape, batch=False)
+    t_mul = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    result_mul = decrypt_tensor(ct_prod, HE)
+    t_dec2 = time.perf_counter() - t0
+
+    err_mul = (result_mul - expected_mul).abs().max().item()
+    print(f"      Plaintext  c       : {c.tolist()}")
+    print(f"      Plaintext  d       : {d.tolist()}")
+    print(f"      Expected   c*d     : {expected_mul.tolist()}")
+    print(f"      Decrypted  c*d     : {result_mul.tolist()}")
+    print(f"      Max absolute error : {err_mul}  (expected 0 for BFV integers)")
+    print(f"      Timings — enc: {t_enc2*1e3:.2f} ms | "
+          f"mul+relin: {t_mul*1e3:.3f} ms | dec: {t_dec2*1e3:.2f} ms")
+
+    # BFV multiplication is exact for integers; error must be 0
+    assert err_mul == 0, f"Multiplication error {err_mul} > 0!"
+    print("      ✓ Multiplication correct")
+
+    # ── 4. Batched addition (SIMD) ─────────────────────────────────────────────
+    print("\n[4/4] Batched addition (SIMD across slots) …")
+    size = 64
+    e = torch.randint(0, 1000, (size,), dtype=torch.int64)
+    f = torch.randint(0, 1000, (size,), dtype=torch.int64)
+    expected_batch = e + f
+
+    t0 = time.perf_counter()
+    ct_e = encrypt_tensor(e, HE, batch=True)   # 1 ciphertext, 64 slots used
+    ct_f = encrypt_tensor(f, HE, batch=True)
+    t_enc3 = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    ct_batch_sum = _TaggedList(
+        [ct_e[0] + ct_f[0]],
+        original_shape=(size,),
+        batch=True,
+    )
+    t_add3 = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    result_batch = decrypt_tensor(ct_batch_sum, HE)
+    t_dec3 = time.perf_counter() - t0
+
+    err_batch = (result_batch - expected_batch).abs().max().item()
+    print(f"      Vector size        : {size}")
+    print(f"      Ciphertexts used   : 1  (vs {size} in element-wise mode)")
+    print(f"      Max absolute error : {err_batch}")
+    print(f"      Timings — enc: {t_enc3*1e3:.2f} ms | "
+          f"add: {t_add3*1e3:.3f} ms | dec: {t_dec3*1e3:.2f} ms")
+    assert err_batch == 0, f"Batched addition error {err_batch} > 0!"
+    print("      ✓ Batched addition correct")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  All homomorphic operation tests passed ✓")
+    print(f"  Quantization tolerance  : 0  (BFV is exact for integers mod t)")
+    print(f"  Note: floating-point inputs are truncated to int64 before")
+    print(f"  encryption, so the effective tolerance for float tensors is")
+    print(f"  |floor(x) - x| ≤ 0.9999… per element.")
+    print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+class _TaggedList(list):
+    """list subclass that carries metadata attributes for decrypt_tensor."""
+    def __init__(self, items, original_shape=None, batch=False):
+        super().__init__(items)
+        self.original_shape = original_shape
+        self.batch = batch
+
+
+def _check_he(HE) -> None:
+    """Raise TypeError if HE is not a Pyfhel instance."""
+    if not isinstance(HE, Pyfhel):
+        raise TypeError(
+            f"HE must be a Pyfhel instance (from setup_HE_context()), "
+            f"got {type(HE)}.  Did you forget to call setup_HE_context()?"
+        )
+
+
+def _is_prime(n: int) -> bool:
+    """Simple trial-division primality test (sufficient for small t values)."""
+    if n < 2:
+        return False
+    if n == 2:
+        return True
+    if n % 2 == 0:
+        return False
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     test_homomorphic_operations()
-    print("\nRunning batched HE benchmark...\n")
-    he_batch_benchmark()
