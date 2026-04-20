@@ -1,529 +1,548 @@
 """
-Selective Homomorphic Encryption Inference Engine
+selective_he_engine.py
+======================
+Mixed plaintext / homomorphic-encryption inference engine.
 
-Mixes plaintext and homomorphic encryption (HE) computation at layer/operation granularity.
-For each layer, checks if encryption is requested in config, and conditionally:
-  - Encrypts inputs
-  - Runs HE versions of required operations
-  - Decrypts outputs
-Otherwise, runs standard PyTorch forward passes.
+Overview
+--------
+``selective_HE_inference`` walks a PyTorch model's named layers in forward-
+execution order and applies one of two compute strategies per layer:
 
-Provides detailed timing breakdown and encryption state tracking for analysis.
+  • **Plaintext** — standard ``torch`` forward pass, no crypto overhead.
+  • **HE**        — encrypt inputs → run the HE equivalent op from
+                    ``he_layers.py`` → decrypt outputs back to int64 tensors.
 
-Key Limitations:
-- Batch size = 1 (recommended)
-- Quantization to integers for HE operations
-- Noise growth limits depth
+The caller controls which layers get encrypted via ``SelectiveHEConfig``.
 
-Usage Example:
-    from selective_he_config import SelectiveHEConfig, load_strategy_config
-    from selective_he_engine import selective_HE_inference
-    from he_utils import setup_HE_context
-    
-    config = load_strategy_config(1)
-    HE = setup_HE_context()
-    logits, timings, enc_log = selective_HE_inference(model, input_ids, HE, config)
+Design philosophy
+-----------------
+- Only ``nn.Linear`` is supported for HE compute in this file (matching
+  ``he_linear`` from he_layers.py).  Passing a non-Linear layer in
+  ``layers_to_encrypt`` raises a ``ConfigError``.
+- Batch size must be 1 (element-wise BFV encryption).
+- Activation layers (ReLU, GELU …) always run in plaintext; they cannot
+  be expressed in BFV without polynomial approximations.
+- The engine does **not** modify the model in-place; it shadows each layer
+  with its own forward logic.
+
+Return values
+-------------
+``selective_HE_inference`` returns a 3-tuple::
+
+    (logits, timing_dict, encryption_state_log)
+
+    logits               : torch.Tensor  — final model output
+    timing_dict          : dict          — aggregated wall-clock seconds:
+                             plain_time, encryption_time,
+                             he_compute_time, decryption_time
+    encryption_state_log : list[tuple]   — [(layer_name, was_encrypted), …]
+
+Usage
+-----
+See the ``__main__`` block at the bottom for a runnable example.
 """
 
+from __future__ import annotations
+
+import time
+import warnings
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import time
-from typing import Tuple, List, Dict, Any, Optional
-from Pyfhel import Pyfhel
 
-from he_utils import setup_HE_context, encrypt_tensor, decrypt_tensor
-from he_layers import he_linear
-from selective_he_config import SelectiveHEConfig
+# ── he_layers imports (must be on the path) ───────────────────────────────────
+try:
+    from Pyfhel import Pyfhel
+    from he_layers import he_linear
+    from he_utils import encrypt_tensor, decrypt_tensor, setup_HE_context, _TaggedList
+    _PYFHEL_AVAILABLE = True
+except ImportError as _e:
+    _PYFHEL_AVAILABLE = False
+    _PYFHEL_IMPORT_ERR = _e
 
 
-class EncryptionState:
-    """Helper class to track tensor encryption state throughout inference."""
-    
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class ConfigError(ValueError):
+    """Raised when the SelectiveHEConfig requests an impossible operation."""
+
+
+class PyfhelUnavailableError(RuntimeError):
+    """Raised when Pyfhel is not installed but HE compute is requested."""
+
+
+# ---------------------------------------------------------------------------
+# Configuration dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SelectiveHEConfig:
+    """
+    Configuration for mixed plaintext / HE inference.
+
+    Attributes
+    ----------
+    layers_to_encrypt : list[str]
+        Exact dot-separated module names (as returned by
+        ``model.named_modules()``) that should be evaluated homomorphically.
+        Example: ``["classifier.0", "classifier.2"]``.
+
+    weight_scale : int
+        Integer scale factor applied to weights **before** HE compute.
+        Because BFV is integer-only, floating-point weights are rounded to
+        ``round(W * weight_scale)``.  The decrypted output is then divided
+        by ``weight_scale`` to recover approximate float values.
+        Default: 1 (weights treated as already-integer; use larger values
+        for float weight models, e.g. 100).
+
+    bias_scale : int
+        Scale for bias (should match ``weight_scale`` when input is also
+        scaled, or ``weight_scale**2`` when both input and weight are scaled).
+        Default: 1.
+
+    input_scale : int
+        Scale applied to the *input tensor* before encryption.
+        Decrypted output is divided by ``input_scale * weight_scale``.
+        Default: 1.
+
+    batch_size_check : bool
+        If True (default), raise ``ConfigError`` when batch size > 1.
+    """
+    layers_to_encrypt: list[str] = field(default_factory=list)
+    weight_scale:      int  = 1
+    bias_scale:        int  = 1
+    input_scale:       int  = 1
+    batch_size_check:  bool = True
+
+
+# ---------------------------------------------------------------------------
+# Timing accumulator
+# ---------------------------------------------------------------------------
+
+class _TimingAccumulator:
+    """Simple container for per-phase wall-clock totals (seconds)."""
+
     def __init__(self):
-        self.tensor_states = {}  # Maps tensor id to bool (encrypted or not)
-    
-    def mark_encrypted(self, tensor_name: str) -> None:
-        """Mark a tensor as encrypted."""
-        self.tensor_states[tensor_name] = True
-    
-    def mark_plaintext(self, tensor_name: str) -> None:
-        """Mark a tensor as plaintext."""
-        self.tensor_states[tensor_name] = False
-    
-    def is_encrypted(self, tensor_name: str) -> bool:
-        """Check if tensor is encrypted."""
-        return self.tensor_states.get(tensor_name, False)
-    
-    def summary(self) -> Dict[str, bool]:
-        """Get summary of all tensor states."""
-        return self.tensor_states.copy()
+        self.plain_time       = 0.0
+        self.encryption_time  = 0.0
+        self.he_compute_time  = 0.0
+        self.decryption_time  = 0.0
 
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "plain_time":       self.plain_time,
+            "encryption_time":  self.encryption_time,
+            "he_compute_time":  self.he_compute_time,
+            "decryption_time":  self.decryption_time,
+        }
+
+    @property
+    def total(self) -> float:
+        return (self.plain_time + self.encryption_time +
+                self.he_compute_time + self.decryption_time)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_named_layers(model: nn.Module) -> dict[str, nn.Module]:
+    """
+    Return an ordered dict mapping full dotted name → module for every
+    *leaf* layer in the model (i.e. layers with no children of their own).
+    """
+    return {
+        name: mod
+        for name, mod in model.named_modules()
+        if len(list(mod.children())) == 0 and name != ""
+    }
+
+
+def _validate_config(
+    config: SelectiveHEConfig,
+    named_layers: dict[str, nn.Module],
+) -> None:
+    """
+    Validate config against the actual model topology.
+
+    Raises ConfigError for:
+      • A name in layers_to_encrypt that does not exist in the model.
+      • A name in layers_to_encrypt whose layer is not nn.Linear.
+      • HE requested but Pyfhel is not installed.
+    """
+    if config.layers_to_encrypt and not _PYFHEL_AVAILABLE:
+        raise PyfhelUnavailableError(
+            "HE layers requested but Pyfhel could not be imported.\n"
+            f"Original error: {_PYFHEL_IMPORT_ERR}\n"
+            "Install with:  pip install Pyfhel"
+        )
+
+    for name in config.layers_to_encrypt:
+        if name not in named_layers:
+            available = list(named_layers.keys())
+            raise ConfigError(
+                f"Layer '{name}' requested for HE compute was not found in "
+                f"the model.\nAvailable leaf layers: {available}"
+            )
+        layer = named_layers[name]
+        if not isinstance(layer, nn.Linear):
+            raise ConfigError(
+                f"Layer '{name}' is {type(layer).__name__}, but only "
+                f"nn.Linear is supported for HE compute.  "
+                f"Move activation / norm layers out of layers_to_encrypt."
+            )
+
+
+def _run_he_linear(
+    x: torch.Tensor,
+    layer: nn.Linear,
+    HE: Pyfhel,
+    config: SelectiveHEConfig,
+    timing: _TimingAccumulator,
+) -> torch.Tensor:
+    """
+    Run a single nn.Linear layer homomorphically.
+
+    Steps
+    -----
+    1. Scale + cast input to int64.
+    2. Encrypt (element-wise, batch=False).
+    3. Call ``he_linear`` with scaled int weights + bias.
+    4. Decrypt → float tensor, divide by combined scale.
+
+    Parameters
+    ----------
+    x      : (1, in_features) float tensor  — plaintext activation.
+    layer  : nn.Linear whose .weight and .bias we use.
+    HE     : initialised Pyfhel context.
+    config : holds scale factors.
+    timing : mutable accumulator updated in-place.
+
+    Returns
+    -------
+    torch.Tensor of shape (1, out_features), dtype float32.
+    """
+    # ── Input scaling & shape check ────────────────────────────────────────
+    if x.dim() == 1:
+        x = x.unsqueeze(0)                         # → (1, in_features)
+    if x.shape[0] != 1:
+        raise ConfigError(
+            f"HE compute requires batch_size=1, got {x.shape[0]}. "
+            "Set config.batch_size_check=True and pass a single sample."
+        )
+
+    # Scale input to integer domain
+    x_scaled = (x * config.input_scale).round().to(torch.int64)  # (1, in_F)
+
+    # ── Encryption ────────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    enc_x = encrypt_tensor(x_scaled, HE, batch=False)
+    timing.encryption_time += time.perf_counter() - t0
+
+    # ── Prepare plaintext weights / bias ─────────────────────────────────
+    # nn.Linear stores weight as (out_features, in_features); he_linear
+    # expects (in_features, out_features).
+    W_np = (
+        layer.weight.detach().cpu().float().numpy() * config.weight_scale
+    ).round().astype(np.int64).T          # → (in_F, out_F)
+
+    if layer.bias is not None:
+        b_np = (
+            layer.bias.detach().cpu().float().numpy() * config.bias_scale
+        ).round().astype(np.int64)
+    else:
+        b_np = np.zeros(layer.out_features, dtype=np.int64)
+
+    # ── HE compute ────────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    enc_y = he_linear(enc_x, W_np, b_np, HE)
+    timing.he_compute_time += time.perf_counter() - t0
+
+    # ── Decryption ────────────────────────────────────────────────────────
+    t0 = time.perf_counter()
+    y_int = decrypt_tensor(enc_y, HE)              # (1, out_F) int64 tensor
+    timing.decryption_time += time.perf_counter() - t0
+
+    # Un-scale: divide by the product of both scale factors
+    combined_scale = float(config.input_scale * config.weight_scale)
+    y_float = y_int.float() / combined_scale       # (1, out_F) float32
+
+    return y_float
+
+
+def _run_plain_layer(
+    layer: nn.Module,
+    x: torch.Tensor,
+    timing: _TimingAccumulator,
+) -> torch.Tensor:
+    """Run layer in plaintext, accumulate wall-clock time."""
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        y = layer(x)
+    timing.plain_time += time.perf_counter() - t0
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def selective_HE_inference(
     model: nn.Module,
     input_ids: torch.Tensor,
-    HE_context: Pyfhel,
+    HE_context: "Pyfhel | None",
     config: SelectiveHEConfig,
-    verbose: bool = True
-) -> Tuple[torch.Tensor, Dict[str, Any], List[Tuple[str, bool]]]:
+) -> tuple[torch.Tensor, dict[str, float], list[tuple[str, bool]]]:
     """
-    Mixed plaintext and homomorphic encryption inference.
-    
-    Traverses model layers in execution order. For each layer:
-      - If layer in config.layers_to_encrypt:
-          * Encrypt input tensors
-          * Run HE versions of operations (from he_layers.py)
-          * Decrypt outputs
-      - Else: Run standard PyTorch layer
-    
-    Args:
-        model: PyTorch neural network model to inference
-        input_ids: Token IDs of shape (batch_size, seq_len)
-                   Note: batch_size=1 is strongly recommended
-        HE_context: Initialized Pyfhel object for encryption/decryption
-        config: SelectiveHEConfig specifying which layers/ops to encrypt
-        verbose: If True, print detailed logs and timing breakdown
-    
-    Returns:
-        logits: Model output logits of shape (batch_size, seq_len, vocab_size)
-        timing_dict: Dict with timing breakdown:
-            {
-                'total_time': float (ms),
-                'plain_time': float (ms) - plaintext compute
-                'encryption_time': float (ms) - encrypt + decrypt operations
-                'he_compute_time': float (ms) - HE layer computations
-                'layer_timings': Dict[str, Dict] - per-layer breakdown
-            }
-        encryption_state_log: List of (layer_name, was_encrypted) tuples
-    
-    Raises:
-        ValueError: If config validation fails or input incompatible
-        RuntimeError: If HE operations fail (e.g., noise overflow)
-    
-    Notes:
-        - Requires batch_size=1 for correctness of HE operations
-        - Integer quantization applied for HE (rounding to integers)
-        - Encryption/decryption dominates timing for small networks
-        - HE operations ~1000x slower than plaintext
-    """
-    
-    # Validate configuration
-    try:
-        config.validate(model)
-    except (ValueError, KeyError) as e:
-        raise ValueError(f"Configuration validation failed: {e}")
-    
-    # Validate input
-    batch_size = input_ids.shape[0]
-    if batch_size != 1:
-        raise ValueError(
-            f"Batch size must be 1, got {batch_size}. "
-            f"HE operations not designed for batch > 1."
-        )
-    
-    if verbose:
-        print("=" * 80)
-        print("SELECTIVE HOMOMORPHIC ENCRYPTION INFERENCE")
-        print("=" * 80)
-        print(f"Model: {model._class.name_}")
-        print(f"Input shape: {input_ids.shape}")
-        print(f"Encryption config: granularity={config.encryption_granularity}")
-        print(f"Layers to encrypt: {config.layers_to_encrypt}")
-        print("=" * 80)
-    
-    # Initialize timing and state tracking
-    timing_dict = {
-        'total_time': 0.0,
-        'plain_time': 0.0,
-        'encryption_time': 0.0,
-        'he_compute_time': 0.0,
-        'layer_timings': {}
-    }
-    
-    encryption_state_log = []
-    encryption_state = EncryptionState()
-    
-    total_start = time.perf_counter()
-    
-    # ========================================================================
-    # PHASE 1: Embedding Layer (typically not encrypted)
-    # ========================================================================
-    if hasattr(model, 'embedding'):
-        layer_name = 'embedding'
-        layer_start = time.perf_counter()
-        
-        # Embedding is usually not encrypted (works with indices)
-        embedding_layer = getattr(model, 'embedding', None)
-        assert isinstance(embedding_layer, nn.Module), "embedding must be an nn.Module"
-        x = embedding_layer(input_ids)  # (1, seq_len, d_model)
-        
-        layer_time = (time.perf_counter() - layer_start) * 1000
-        timing_dict['plain_time'] += layer_time
-        timing_dict['layer_timings'][layer_name] = {
-            'time_ms': layer_time,
-            'encrypted': False,
-            'type': 'embedding'
-        }
-        encryption_state_log.append((layer_name, False))
-        encryption_state.mark_plaintext(layer_name)
-        
-        if verbose:
-            print(f"✓ Embedding (plaintext): {layer_time:.2f} ms")
-    
-    # ========================================================================
-    # PHASE 2: Transformer Blocks
-    # ========================================================================
-    if hasattr(model, 'blocks'):
-        blocks_module = getattr(model, 'blocks', None)
-        # Handle both ModuleList and ModuleDict
-        blocks_iter = None
-        if isinstance(blocks_module, nn.ModuleList):
-            blocks_iter = enumerate(blocks_module)
-        elif isinstance(blocks_module, nn.ModuleDict):
-            blocks_iter = enumerate(blocks_module.values())
-        else:
-            blocks_iter = None
-        
-        if blocks_iter is not None:
-            for block_idx, block in blocks_iter:
-                block_name = f"block_{block_idx}"
-                block_start = time.perf_counter()
-                
-                is_encrypted = block_name in config.layers_to_encrypt
-                
-                if is_encrypted:
-                    # Encrypt input to block
-                    enc_start = time.perf_counter()
-                    
-                    # Flatten batch and sequence dimensions for encryption
-                    # Input shape: (batch_size, seq_len, d_model) -> (seq_len, d_model)
-                    # Note: batch_size=1 as per recommendation
-                    x_2d = x.squeeze(0)  # Remove batch dimension: (seq_len, d_model)
-                    
-                    # Quantize to int for HE
-                    x_int = (x_2d * 100).int()  # scale up then quantize
-                    encrypted_x = encrypt_tensor(x_int, HE_context, batch=False)
-                    
-                    enc_time = (time.perf_counter() - enc_start) * 1000
-                    timing_dict['encryption_time'] += enc_time
-                    
-                    # Process block components
-                    # Note: For full implementation, would need HE versions of:
-                    # - layer norm
-                    # - self-attention
-                    # - FFN
-                    # For now, decrypt after attention, keep FFN in plaintext
-                    
-                    # Attention sub-layer
-                    if hasattr(block, 'ln1'):
-                        ln1_layer = getattr(block, 'ln1', None)
-                        assert isinstance(ln1_layer, nn.Module), "ln1 must be an nn.Module"
-                        x = ln1_layer(x)
-                    
-                    if hasattr(block, 'attention'):
-                        # HE attention would go here
-                        # For demo: run plaintext attention and "mark" as encrypted
-                        he_attn_start = time.perf_counter()
-                        
-                        attention_layer = getattr(block, 'attention', None)
-                        assert isinstance(attention_layer, nn.Module), "attention must be an nn.Module"
-                        attn_output, _ = attention_layer(x)
-                        x = x + attn_output
-                        
-                        he_attn_time = (time.perf_counter() - he_attn_start) * 1000
-                        timing_dict['he_compute_time'] += he_attn_time
-                    
-                    # Decrypt intermediate
-                    dec_start = time.perf_counter()
-                    # In real scenario: x_decrypted = decrypt_tensor(encrypted_output)
-                    # For now: x remains as is
-                    dec_time = (time.perf_counter() - dec_start) * 1000
-                    timing_dict['encryption_time'] += dec_time
-                    
-                    # FFN sub-layer (plaintext)
-                    if hasattr(block, 'ln2'):
-                        ln2_layer = getattr(block, 'ln2', None)
-                        assert isinstance(ln2_layer, nn.Module), "ln2 must be an nn.Module"
-                        x = ln2_layer(x)
-                    
-                    if hasattr(block, 'ffn'):
-                        ffn_layer = getattr(block, 'ffn', None)
-                        assert isinstance(ffn_layer, nn.Module), "ffn must be an nn.Module"
-                        ffn_output = ffn_layer(x)
-                        x = x + ffn_output
-                    
-                    block_time = (time.perf_counter() - block_start) * 1000
-                    timing_dict['layer_timings'][block_name] = {
-                        'time_ms': block_time,
-                        'encrypted': True,
-                        'type': 'transformer_block'
-                    }
-                    encryption_state_log.append((block_name, True))
-                    encryption_state.mark_encrypted(block_name)
-                    
-                    if verbose:
-                        print(f"✓ {block_name} (ENCRYPTED): {block_time:.2f} ms")
-                
-                else:
-                    # Plaintext block execution
-                    plain_start = time.perf_counter()
-                    assert isinstance(block, nn.Module), "block must be an nn.Module"
-                    x = block(x)
-                    plain_time = (time.perf_counter() - plain_start) * 1000
-                    
-                    timing_dict['plain_time'] += plain_time
-                    timing_dict['layer_timings'][block_name] = {
-                        'time_ms': plain_time,
-                        'encrypted': False,
-                        'type': 'transformer_block'
-                    }
-                    encryption_state_log.append((block_name, False))
-                    encryption_state.mark_plaintext(block_name)
-                    
-                    if verbose:
-                        print(f"✓ {block_name} (plaintext): {plain_time:.2f} ms")
-    
-    # ========================================================================
-    # PHASE 3: Final Layer Norm
-    # ========================================================================
-    if hasattr(model, 'ln_f'):
-        layer_name = 'ln_f'
-        layer_start = time.perf_counter()
-        
-        ln_f_layer = getattr(model, 'ln_f', None)
-        assert isinstance(ln_f_layer, nn.Module), "ln_f must be an nn.Module"
-        x = ln_f_layer(x)
-        
-        layer_time = (time.perf_counter() - layer_start) * 1000
-        timing_dict['plain_time'] += layer_time
-        timing_dict['layer_timings'][layer_name] = {
-            'time_ms': layer_time,
-            'encrypted': False,
-            'type': 'layer_norm'
-        }
-        encryption_state_log.append((layer_name, False))
-        encryption_state.mark_plaintext(layer_name)
-        
-        if verbose:
-            print(f"✓ ln_f (plaintext): {layer_time:.2f} ms")
-    
-    # ========================================================================
-    # PHASE 4: Language Modeling Head
-    # ========================================================================
-    is_lm_head_encrypted = 'lm_head' in config.layers_to_encrypt
-    
-    if hasattr(model, 'lm_head'):
-        layer_name = 'lm_head'
-        layer_start = time.perf_counter()
-        
-        lm_head_module = getattr(model, 'lm_head', None)
-        assert isinstance(lm_head_module, nn.Module), "lm_head must be an nn.Module"
-        
-        if is_lm_head_encrypted:
-            # Encrypt, apply HE linear, decrypt
-            enc_start = time.perf_counter()
-            
-            # Flatten and quantize input for HE
-            # Input shape: (batch_size, seq_len, d_model) -> (seq_len, d_model)
-            x_2d = x.squeeze(0)  # Remove batch dimension
-            x_int = (x_2d * 100).int()
-            encrypted_x = encrypt_tensor(x_int, HE_context, batch=False)
-            
-            enc_time = (time.perf_counter() - enc_start) * 1000
-            timing_dict['encryption_time'] += enc_time
-            
-            # HE linear layer
-            he_start = time.perf_counter()
-            
-            # Apply he_linear to each position in sequence
-            logits_encrypted = []
-            for pos in range(x.shape[1]):
-                pos_encrypted = encrypt_tensor(
-                    (x[0, pos, :] * 100).int(),
-                    HE_context,
-                    batch=False
-                )
-                # Ensure weight and bias are properly typed and detached for HE ops
-                lm_weight_param = getattr(lm_head_module, 'weight', None)
-                lm_bias_param = getattr(lm_head_module, 'bias', None)
-                
-                assert isinstance(lm_weight_param, torch.Tensor), "lm_head.weight must be a Tensor"
-                lm_weight: torch.Tensor = lm_weight_param.detach()
-                
-                if lm_bias_param is not None:
-                    assert isinstance(lm_bias_param, torch.Tensor), "lm_head.bias must be a Tensor or None"
-                    lm_bias: torch.Tensor | None = lm_bias_param.detach()
-                else:
-                    lm_bias = None
-                
-                pos_logits = he_linear(
-                    pos_encrypted,
-                    lm_weight.t(),
-                    lm_bias,
-                    HE_context
-                )
-                logits_encrypted.append(pos_logits)
-            
-            he_time = (time.perf_counter() - he_start) * 1000
-            timing_dict['he_compute_time'] += he_time
-            
-            # Decrypt logits
-            dec_start = time.perf_counter()
-            logits = []
-            for pos_logits in logits_encrypted:
-                pos_decrypted = decrypt_tensor(pos_logits, HE_context)
-                # Scale back down: convert to tensor and denormalize
-                pos_tensor = torch.as_tensor(pos_decrypted, dtype=torch.float32) / 100.0
-                logits.append(pos_tensor)
-            logits_tensor = torch.stack(logits).unsqueeze(0)  # (1, seq_len, vocab_size)
-            
-            dec_time = (time.perf_counter() - dec_start) * 1000
-            timing_dict['encryption_time'] += dec_time
-            
-            layer_time = (time.perf_counter() - layer_start) * 1000
-            timing_dict['layer_timings'][layer_name] = {
-                'time_ms': layer_time,
-                'encrypted': True,
-                'type': 'linear_head'
-            }
-            encryption_state_log.append((layer_name, True))
-            encryption_state.mark_encrypted(layer_name)
-            
-            if verbose:
-                print(f"✓ lm_head (ENCRYPTED): {layer_time:.2f} ms")
-        
-        else:
-            # Plaintext LM head
-            logits_tensor = lm_head_module(x)
-            
-            layer_time = (time.perf_counter() - layer_start) * 1000
-            timing_dict['plain_time'] += layer_time
-            timing_dict['layer_timings'][layer_name] = {
-                'time_ms': layer_time,
-                'encrypted': False,
-                'type': 'linear_head'
-            }
-            encryption_state_log.append((layer_name, False))
-            encryption_state.mark_plaintext(layer_name)
-            
-            if verbose:
-                print(f"✓ lm_head (plaintext): {layer_time:.2f} ms")
-    
-    # ========================================================================
-    # FINALIZATION
-    # ========================================================================
-    total_time = (time.perf_counter() - total_start) * 1000
-    timing_dict['total_time'] = total_time
-    
-    if verbose:
-        print("\n" + "=" * 80)
-        print("TIMING BREAKDOWN")
-        print("=" * 80)
-        print(f"Total inference time: {timing_dict['total_time']:.2f} ms")
-        print(f"  Plaintext compute: {timing_dict['plain_time']:.2f} ms "
-              f"({timing_dict['plain_time']/total_time*100:.1f}%)")
-        print(f"  Encryption + Decryption: {timing_dict['encryption_time']:.2f} ms "
-              f"({timing_dict['encryption_time']/total_time*100:.1f}%)")
-        print(f"  HE compute: {timing_dict['he_compute_time']:.2f} ms "
-              f"({timing_dict['he_compute_time']/total_time*100:.1f}%)")
-        
-        print("\nPer-Layer Timings:")
-        for layer_name, layer_info in timing_dict['layer_timings'].items():
-            enc_marker = "🔒 ENCRYPTED" if layer_info['encrypted'] else "🔓 plaintext"
-            print(f"  {layer_name:20s}: {layer_info['time_ms']:8.2f} ms [{enc_marker}]")
-        
-        print("\n" + "=" * 80)
-        print("ENCRYPTION STATE LOG")
-        print("=" * 80)
-        for layer_name, was_encrypted in encryption_state_log:
-            enc_marker = "✓ ENCRYPTED" if was_encrypted else "✗ plaintext"
-            print(f"  {layer_name:20s}: {enc_marker}")
-        
-        print("=" * 80 + "\n")
-    
-    return logits_tensor, timing_dict, encryption_state_log
+    Run mixed plaintext / HE inference through ``model``.
 
+    Parameters
+    ----------
+    model : nn.Module
+        PyTorch model whose leaf layers are traversed in order.
+        The model should be in eval mode; this function calls
+        ``model.eval()`` automatically.
 
-# ============================================================================
-# EXAMPLE USAGE AND TESTING
-# ============================================================================
+    input_ids : torch.Tensor
+        Input tensor, shape ``(batch, *)``.  For HE layers batch must be 1.
+        May be float or int; HE layers convert internally.
 
-def demo_selective_he_inference():
+    HE_context : Pyfhel or None
+        Initialised Pyfhel object (from ``setup_HE_context``).
+        Pass ``None`` only if ``config.layers_to_encrypt`` is empty.
+
+    config : SelectiveHEConfig
+        Specifies which layers run under HE and scale factors.
+
+    Returns
+    -------
+    logits : torch.Tensor
+        Final output of the model (same shape as a normal forward pass).
+
+    timing_dict : dict[str, float]
+        Aggregated wall-clock seconds for each phase:
+        ``plain_time``, ``encryption_time``, ``he_compute_time``,
+        ``decryption_time``.  Sum = total wall time of inference.
+
+    encryption_state_log : list[tuple[str, bool]]
+        One entry per leaf layer: ``(layer_name, was_encrypted)``.
+
+    Raises
+    ------
+    ConfigError          : impossible config (bad layer name, wrong type, batch>1).
+    PyfhelUnavailableError : HE requested but Pyfhel not installed.
     """
-    Demonstrate selective HE inference with different strategies.
-    
-    Creates a toy model, loads different strategies, and runs inference
-    with detailed timing and encryption state reporting.
-    """
-    # Import here to avoid circular dependencies
-    from selective_he_config import load_strategy_config
-    
-    # For demo purposes, create a minimal model
-    print("\n" + "=" * 80)
-    print("SELECTIVE HE INFERENCE DEMO")
-    print("=" * 80)
-    
-    # Setup HE context
-    print("\n[Setup] Initializing HE context...")
-    setup_start = time.perf_counter()
-    HE = setup_HE_context(n=2**14, t=65537)
-    setup_time = (time.perf_counter() - setup_start) * 1000
-    print(f"✓ HE context ready in {setup_time:.2f} ms\n")
-    
-    # Try to import TinyGPT if available, else use minimal model
-    try:
-        from model import TinyGPT
-        model = TinyGPT(
-            num_layers=2,
-            vocab_size=256,
-            d_model=32,
-            num_heads=2,
-            d_ff=64,
-            max_len=64,
-            dropout=0.1
-        )
-        print("✓ Loaded TinyGPT model")
-    except ImportError:
-        print("⚠ Could not import TinyGPT, using minimal model")
-        # Create a minimal model for testing
-        model = nn.Sequential(
-            nn.Embedding(256, 32),
-            nn.Linear(32, 256)
-        )
-    
     model.eval()
-    
-    # Create test input
-    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)  # batch_size=1, seq_len=3
-    
-    # Test all three strategies
-    for strategy_num in [1, 2, 3]:
-        print(f"\n{'=' * 80}")
-        print(f"STRATEGY {strategy_num}")
-        print(f"{'=' * 80}")
-        
-        try:
-            config = load_strategy_config(strategy_num)
-            config.summary()
-            
-            print("\nRunning inference...")
-            logits, timings, enc_log = selective_HE_inference(
-                model,
-                input_ids,
-                HE,
-                config,
-                verbose=True
-            )
-            
-            print(f"Output logits shape: {logits.shape}")
-            print(f"Encryption state log entries: {len(enc_log)}")
-            
-        except Exception as e:
-            print(f"⚠ Error during inference: {e}")
-            import traceback
-            traceback.print_exc()
 
+    # ── Collect leaf layers in model ───────────────────────────────────────
+    named_layers = _get_named_layers(model)
+    _validate_config(config, named_layers)
+
+    he_set = set(config.layers_to_encrypt)
+
+    # ── Batch size guard ───────────────────────────────────────────────────
+    if config.batch_size_check and he_set:
+        if input_ids.shape[0] != 1:
+            raise ConfigError(
+                f"HE compute requires batch_size=1, got {input_ids.shape[0]}. "
+                "Slice a single sample: input_ids = input_ids[:1]"
+            )
+
+    # ── HE context guard ──────────────────────────────────────────────────
+    if he_set and HE_context is None:
+        raise ConfigError(
+            "config.layers_to_encrypt is non-empty but HE_context is None.  "
+            "Pass an initialised Pyfhel object."
+        )
+
+    # ── Inference loop ────────────────────────────────────────────────────
+    timing = _TimingAccumulator()
+    state_log: list[tuple[str, bool]] = []
+    x = input_ids
+
+    for layer_name, layer in named_layers.items():
+        encrypted = layer_name in he_set
+
+        if encrypted:
+            y = _run_he_linear(x, layer, HE_context, config, timing)
+        else:
+            y = _run_plain_layer(layer, x, timing)
+
+        state_log.append((layer_name, encrypted))
+        x = y
+
+    logits = x
+    return logits, timing.to_dict(), state_log
+
+
+# ---------------------------------------------------------------------------
+# Pretty-print helpers
+# ---------------------------------------------------------------------------
+
+def print_timing_report(
+    timing_dict: dict[str, float],
+    encryption_state_log: list[tuple[str, bool]],
+) -> None:
+    """Print a formatted timing breakdown and encryption state list."""
+    total = sum(timing_dict.values())
+
+    print("\n" + "═" * 62)
+    print("  Selective HE Inference — Timing Report")
+    print("═" * 62)
+
+    rows = [
+        ("Plaintext compute",  "plain_time"),
+        ("Encryption",         "encryption_time"),
+        ("HE compute",         "he_compute_time"),
+        ("Decryption",         "decryption_time"),
+    ]
+    for label, key in rows:
+        t = timing_dict[key]
+        pct = 100 * t / total if total > 0 else 0
+        bar = "█" * int(pct / 2)
+        print(f"  {label:<22} {t*1e3:>8.2f} ms  [{bar:<50}] {pct:5.1f}%")
+    print(f"  {'─'*60}")
+    print(f"  {'Total':<22} {total*1e3:>8.2f} ms")
+
+    print("\n  Layer Encryption State Log")
+    print("  " + "─" * 44)
+    he_count    = sum(1 for _, enc in encryption_state_log if enc)
+    plain_count = len(encryption_state_log) - he_count
+    for layer_name, encrypted in encryption_state_log:
+        tag = "🔒 HE     " if encrypted else "🔓 PLAIN  "
+        print(f"  {tag} {layer_name}")
+    print("  " + "─" * 44)
+    print(f"  HE layers   : {he_count}")
+    print(f"  Plain layers: {plain_count}")
+    print("═" * 62 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Demo / acceptance test
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    demo_selective_he_inference()
+    print("=" * 62)
+    print("  selective_he_engine.py — Mixed Plaintext / HE Inference Demo")
+    print("=" * 62)
+
+    # ── Build a tiny MLP: 8 → 16 → 8 → 4 ────────────────────────────────
+    class TinyMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(0)
+            self.fc1  = nn.Linear(8,  16, bias=True)
+            self.relu = nn.ReLU()
+            self.fc2  = nn.Linear(16,  8, bias=True)
+            self.act2 = nn.ReLU()
+            self.fc3  = nn.Linear(8,   4, bias=True)
+
+        def forward(self, x):
+            return self.fc3(self.act2(self.fc2(self.relu(self.fc1(x)))))
+
+    model = TinyMLP()
+
+    # Integer-valued weights make BFV exact (no rounding error).
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.constant_(m.weight, 1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    # ── Input ─────────────────────────────────────────────────────────────
+    torch.manual_seed(42)
+    x = torch.randint(1, 5, (1, 8), dtype=torch.float32)
+    print(f"\n  Input tensor (batch=1): {x.tolist()}")
+
+    # ── strategy1: encrypt fc1 and fc3, fc2 in plaintext ─────────────────
+    strategy1 = SelectiveHEConfig(
+        layers_to_encrypt=["fc1", "fc3"],
+        weight_scale=1,
+        bias_scale=1,
+        input_scale=1,
+    )
+
+    print("\n  Setting up HE context (n=2**13, t=65537) …", end=" ", flush=True)
+    t0 = time.perf_counter()
+    HE = setup_HE_context(n=2 ** 13, t=65537)
+    print(f"done ({time.perf_counter()-t0:.2f}s)")
+
+    print("\n  Running selective_HE_inference with strategy1 …")
+    print("  (fc1=HE, relu=plain, fc2=plain, act2=plain, fc3=HE)\n")
+
+    logits, timing_dict, state_log = selective_HE_inference(
+        model, x, HE, strategy1
+    )
+
+    # ── Plaintext reference ───────────────────────────────────────────────
+    with torch.no_grad():
+        plain_logits = model(x)
+
+    # ── Print results ─────────────────────────────────────────────────────
+    print(f"  HE mixed logits     : {logits.flatten().tolist()}")
+    print(f"  Plaintext logits    : {plain_logits.flatten().tolist()}")
+
+    diff = (logits.float() - plain_logits.float()).abs().max().item()
+    print(f"  Max absolute diff   : {diff:.4f}  "
+          f"({'exact' if diff < 1e-3 else 'within float rounding'})")
+
+    print_timing_report(timing_dict, state_log)
+
+    # ── strategy2: all layers in plaintext ───────────────────────────────
+    print("  strategy2: all plaintext (no HE) ───────────────────────────")
+    strategy2 = SelectiveHEConfig(layers_to_encrypt=[])
+    logits2, timing2, log2 = selective_HE_inference(model, x, None, strategy2)
+    print(f"  Plaintext-only logits: {logits2.flatten().tolist()}")
+    print_timing_report(timing2, log2)
+
+    # ── strategy3: only fc2 in HE ─────────────────────────────────────────
+    print("  strategy3: only fc2 in HE ───────────────────────────────────")
+    strategy3 = SelectiveHEConfig(
+        layers_to_encrypt=["fc2"],
+        weight_scale=1,
+        bias_scale=1,
+        input_scale=1,
+    )
+    logits3, timing3, log3 = selective_HE_inference(model, x, HE, strategy3)
+    print(f"  HE-fc2 logits: {logits3.flatten().tolist()}")
+    print_timing_report(timing3, log3)
+
+    # ── Error handling demos ──────────────────────────────────────────────
+    print("  Error handling demos")
+    print("  ─" * 30)
+
+    # Bad layer name
+    try:
+        bad_cfg = SelectiveHEConfig(layers_to_encrypt=["nonexistent_layer"])
+        selective_HE_inference(model, x, HE, bad_cfg)
+    except ConfigError as e:
+        print(f"  ✓ Bad layer name caught: {str(e)[:80]}…")
+
+    # Non-Linear layer
+    try:
+        bad_cfg2 = SelectiveHEConfig(layers_to_encrypt=["relu"])
+        selective_HE_inference(model, x, HE, bad_cfg2)
+    except ConfigError as e:
+        print(f"  ✓ Non-Linear HE caught: {str(e)[:80]}…")
+
+    # Batch size > 1
+    try:
+        x_batch = torch.randint(1, 5, (3, 8), dtype=torch.float32)
+        selective_HE_inference(model, x_batch, HE, strategy1)
+    except ConfigError as e:
+        print(f"  ✓ Batch > 1 caught: {str(e)[:80]}…")
+
+    # HE_context=None with HE layers
+    try:
+        selective_HE_inference(model, x, None, strategy1)
+    except ConfigError as e:
+        print(f"  ✓ None HE context caught: {str(e)[:80]}…")
+
+    print("\n  ✓ All demos and error checks passed")
+    print("=" * 62)

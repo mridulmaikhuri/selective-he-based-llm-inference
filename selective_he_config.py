@@ -1,305 +1,334 @@
 """
-Selective Homomorphic Encryption Configuration Module
-
-Allows fine-grained control over which parts of a neural network model
-to apply homomorphic encryption to, supporting both layer-level and
-operation-level granularity.
+selective_he_config.py
+======================
+Configuration class for selective homomorphic encryption (HE) of neural network layers.
+Supports per-layer and per-operation granularity, JSON serialization, and validation.
 """
 
+from __future__ import annotations
+
 import json
-from typing import List, Dict, Literal, Optional
+import textwrap
 from pathlib import Path
+from typing import Dict, List, Literal
+
 import torch.nn as nn
 
 
+# ---------------------------------------------------------------------------
+# Core configuration class
+# ---------------------------------------------------------------------------
+
 class SelectiveHEConfig:
     """
-    Configuration class for selective homomorphic encryption (HE) in neural networks.
-    
-    This class allows specifying which layers and operations within a model should be
-    encrypted, with support for two granularity levels: layer-wise or operation-wise.
+    Expresses which parts of a model should be encrypted with homomorphic
+    encryption (HE), at either layer or operation granularity.
+
+    Parameters
+    ----------
+    layers_to_encrypt : List[str]
+        Logical layer names to encrypt (e.g. ``["attention_output", "lm_head"]``).
+    operations_to_encrypt : Dict[str, List[str]]
+        Mapping from layer name → list of operations within that layer that
+        should be encrypted (e.g. ``{"attention_output": ["matmul"]}``).
+        Only meaningful when ``encryption_granularity == "operation"``.
+    encryption_granularity : {"layer", "operation"}
+        * ``"layer"``     – encrypt every operation inside the listed layers.
+        * ``"operation"`` – encrypt only the specific operations listed in
+          ``operations_to_encrypt`` for each layer.
     """
-    
+
+    # Recognised logical layer tokens (extend as needed)
+    KNOWN_LAYERS: frozenset[str] = frozenset(
+        {
+            "attention_output",
+            "ffn_output",
+            "lm_head",
+            "embedding",
+            "layer_norm",
+            "query_proj",
+            "key_proj",
+            "value_proj",
+            "output_proj",
+            "mlp_fc1",
+            "mlp_fc2",
+        }
+    )
+
+    # Recognised operation tokens per layer type
+    KNOWN_OPERATIONS: Dict[str, frozenset[str]] = {
+        "attention_output": frozenset({"matmul", "softmax", "scale", "add"}),
+        "ffn_output":       frozenset({"matmul", "gelu", "relu", "add"}),
+        "lm_head":          frozenset({"matmul", "add"}),
+        "embedding":        frozenset({"lookup", "add"}),
+        "layer_norm":       frozenset({"norm", "scale", "add"}),
+        "query_proj":       frozenset({"matmul", "add"}),
+        "key_proj":         frozenset({"matmul", "add"}),
+        "value_proj":       frozenset({"matmul", "add"}),
+        "output_proj":      frozenset({"matmul", "add"}),
+        "mlp_fc1":          frozenset({"matmul", "add", "gelu", "relu"}),
+        "mlp_fc2":          frozenset({"matmul", "add"}),
+    }
+
     def __init__(
         self,
         layers_to_encrypt: List[str],
-        operations_to_encrypt: Optional[Dict[str, List[str]]] = None,
-        encryption_granularity: Literal["layer", "operation"] = "layer"
-    ):
-        """
-        Initialize SelectiveHEConfig.
-        
-        Args:
-            layers_to_encrypt: List of layer names to encrypt (e.g., ["attention_output", "ffn_output"])
-            operations_to_encrypt: Dict mapping layer names to lists of operation names to encrypt
-                                   (e.g., {"attention_output": ["matmul", "softmax"]})
-            encryption_granularity: Level of encryption granularity - "layer" or "operation"
-        """
-        self.layers_to_encrypt = layers_to_encrypt
-        self.operations_to_encrypt = operations_to_encrypt or {}
-        self.encryption_granularity = encryption_granularity
-    
-    def validate(self, model: nn.Module) -> None:
-        """
-        Validate that the configuration's layer and operation names exist in the model.
-        
-        Args:
-            model: PyTorch model to validate against
-            
-        Raises:
-            ValueError: If any specified layers or operations don't exist in the model
-            KeyError: If an operation is specified for a non-existent layer
-        """
-        # Get all module names from the model
-        model_layer_names = {name for name, _ in model.named_modules()}
-        
-        # Validate layers_to_encrypt
-        for layer in self.layers_to_encrypt:
-            if layer not in model_layer_names:
-                raise ValueError(
-                    f"Layer '{layer}' not found in model. "
-                    f"Available layers: {sorted(model_layer_names)}"
-                )
-        
-        # Validate operations_to_encrypt
-        for layer, ops in self.operations_to_encrypt.items():
-            if layer not in self.layers_to_encrypt:
-                raise ValueError(
-                    f"Layer '{layer}' in operations_to_encrypt not found in layers_to_encrypt"
-                )
-            
-            if layer not in model_layer_names:
-                raise ValueError(
-                    f"Layer '{layer}' in operations_to_encrypt not found in model"
-                )
-            
-            # Validate that operations are valid (basic check)
-            valid_ops = {"matmul", "softmax", "add", "mul", "linear", "conv2d", "relu", 
-                        "gelu", "batch_norm", "layer_norm", "attention", "ffn"}
-            for op in ops:
-                if op not in valid_ops:
-                    # Warning rather than error - new ops might be added
-                    print(f"Warning: Operation '{op}' may not be recognized")
-        
-        # Validate granularity
-        if self.encryption_granularity not in ["layer", "operation"]:
+        operations_to_encrypt: Dict[str, List[str]],
+        encryption_granularity: Literal["layer", "operation"],
+    ) -> None:
+        if encryption_granularity not in ("layer", "operation"):
             raise ValueError(
                 f"encryption_granularity must be 'layer' or 'operation', "
-                f"got '{self.encryption_granularity}'"
+                f"got {encryption_granularity!r}"
             )
-        
-        print(f"✓ Configuration validated successfully against model")
-    
-    def to_json(self, path: str) -> None:
+        self.layers_to_encrypt: List[str] = list(layers_to_encrypt)
+        self.operations_to_encrypt: Dict[str, List[str]] = {
+            k: list(v) for k, v in operations_to_encrypt.items()
+        }
+        self.encryption_granularity: Literal["layer", "operation"] = encryption_granularity
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate(self, model: nn.Module) -> None:
         """
-        Save configuration to a JSON file.
-        
-        Args:
-            path: File path to save the configuration
+        Validate the configuration against a concrete ``nn.Module``.
+
+        Checks
+        ------
+        1. All ``layers_to_encrypt`` names are recognised logical tokens.
+        2. All keys in ``operations_to_encrypt`` appear in ``layers_to_encrypt``.
+        3. All operation names are recognised for their respective layer.
+        4. When granularity is ``"operation"``, every layer in
+           ``layers_to_encrypt`` has at least one operation defined.
+
+        Raises
+        ------
+        ValueError
+            On any configuration inconsistency.
         """
-        config_dict = {
+        errors: List[str] = []
+
+        # 1 – unknown layer names
+        unknown_layers = [
+            ln for ln in self.layers_to_encrypt if ln not in self.KNOWN_LAYERS
+        ]
+        if unknown_layers:
+            errors.append(
+                f"Unknown layer name(s): {unknown_layers}. "
+                f"Known layers: {sorted(self.KNOWN_LAYERS)}"
+            )
+
+        # 2 – operations defined for layers not in layers_to_encrypt
+        orphan_ops = [
+            ln for ln in self.operations_to_encrypt
+            if ln not in self.layers_to_encrypt
+        ]
+        if orphan_ops:
+            errors.append(
+                f"operations_to_encrypt references layer(s) not in "
+                f"layers_to_encrypt: {orphan_ops}"
+            )
+
+        # 3 – unknown operation names
+        for layer_name, ops in self.operations_to_encrypt.items():
+            allowed = self.KNOWN_OPERATIONS.get(layer_name, frozenset())
+            bad_ops = [op for op in ops if op not in allowed]
+            if bad_ops:
+                errors.append(
+                    f"Layer '{layer_name}' has unknown operation(s): {bad_ops}. "
+                    f"Allowed: {sorted(allowed)}"
+                )
+
+        # 4 – operation granularity requires explicit ops for every layer
+        if self.encryption_granularity == "operation":
+            missing_ops = [
+                ln for ln in self.layers_to_encrypt
+                if ln not in self.operations_to_encrypt
+                or not self.operations_to_encrypt[ln]
+            ]
+            if missing_ops:
+                errors.append(
+                    f"encryption_granularity='operation' but no operations "
+                    f"defined for layer(s): {missing_ops}"
+                )
+
+        if errors:
+            bullet_list = "\n  • ".join(errors)
+            raise ValueError(
+                f"SelectiveHEConfig validation failed:\n  • {bullet_list}"
+            )
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        return {
             "layers_to_encrypt": self.layers_to_encrypt,
             "operations_to_encrypt": self.operations_to_encrypt,
-            "encryption_granularity": self.encryption_granularity
+            "encryption_granularity": self.encryption_granularity,
         }
-        
-        path_obj = Path(path)
-        path_obj.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(path, 'w') as f:
-            json.dump(config_dict, f, indent=2)
-        
-        print(f"✓ Configuration saved to {path}")
-    
+
+    def to_json(self, path: str | Path) -> None:
+        """Serialise configuration to a JSON file at *path*."""
+        Path(path).write_text(
+            json.dumps(self.to_dict(), indent=2), encoding="utf-8"
+        )
+
     @classmethod
-    def from_json(cls, path: str) -> 'SelectiveHEConfig':
-        """
-        Load configuration from a JSON file.
-        
-        Args:
-            path: File path to load the configuration from
-            
-        Returns:
-            SelectiveHEConfig instance
-        """
-        with open(path, 'r') as f:
-            config_dict = json.load(f)
-        
+    def from_dict(cls, data: dict) -> "SelectiveHEConfig":
         return cls(
-            layers_to_encrypt=config_dict.get("layers_to_encrypt", []),
-            operations_to_encrypt=config_dict.get("operations_to_encrypt", {}),
-            encryption_granularity=config_dict.get("encryption_granularity", "layer")
+            layers_to_encrypt=data["layers_to_encrypt"],
+            operations_to_encrypt=data.get("operations_to_encrypt", {}),
+            encryption_granularity=data["encryption_granularity"],
         )
-    
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "SelectiveHEConfig":
+        """Deserialise a :class:`SelectiveHEConfig` from a JSON file."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(data)
+
+    # ------------------------------------------------------------------
+    # Human-readable summary
+    # ------------------------------------------------------------------
+
     def summary(self) -> str:
-        """
-        Generate a human-readable summary of the encryption configuration.
-        
-        Returns:
-            String containing formatted summary of the configuration
-        """
-        lines = []
-        lines.append("=" * 70)
-        lines.append("SELECTIVE HOMOMORPHIC ENCRYPTION CONFIGURATION SUMMARY")
-        lines.append("=" * 70)
-        
-        lines.append(f"\nEncryption Granularity: {self.encryption_granularity.upper()}")
-        
-        lines.append(f"\nLayers to Encrypt ({len(self.layers_to_encrypt)}):")
-        if self.layers_to_encrypt:
-            for layer in self.layers_to_encrypt:
-                lines.append(f"  • {layer}")
-        else:
-            lines.append("  (none)")
-        
-        lines.append(f"\nOperation-Level Encryption ({len(self.operations_to_encrypt)}):")
-        if self.operations_to_encrypt:
-            for layer, ops in self.operations_to_encrypt.items():
-                ops_str = ", ".join(ops)
-                lines.append(f"  • {layer}: [{ops_str}]")
-        else:
-            lines.append("  (none)")
-        
-        # Calculate encryption stats
-        total_layers = len(self.layers_to_encrypt)
-        total_ops = sum(len(ops) for ops in self.operations_to_encrypt.values())
-        
-        lines.append("\nEncryption Statistics:")
-        lines.append(f"  - Total layers marked for encryption: {total_layers}")
-        lines.append(f"  - Total operations marked for encryption: {total_ops}")
-        
-        if self.encryption_granularity == "operation" and not self.operations_to_encrypt:
-            lines.append("\n  ⚠ WARNING: Granularity is 'operation' but no operations specified!")
-        
-        lines.append("\n" + "=" * 70)
-        
-        summary_text = "\n".join(lines)
-        print(summary_text)
-        return summary_text
-    
-    def __repr__(self) -> str:
+        """Return a human-readable encryption plan."""
+        sep = "─" * 60
+        lines: List[str] = [
+            sep,
+            "  Selective Homomorphic Encryption Configuration",
+            sep,
+            f"  Granularity : {self.encryption_granularity.upper()}",
+            f"  Layers      : {len(self.layers_to_encrypt)} selected",
+            "",
+        ]
+
+        for layer in self.layers_to_encrypt:
+            if self.encryption_granularity == "layer":
+                lines.append(f"  ▸ {layer}")
+                lines.append(f"      → encrypt ALL operations")
+            else:
+                ops = self.operations_to_encrypt.get(layer, [])
+                lines.append(f"  ▸ {layer}")
+                if ops:
+                    for op in ops:
+                        lines.append(f"      → encrypt: {op}")
+                else:
+                    lines.append(f"      → (no operations specified)")
+
+        lines += ["", sep]
+        result = "\n".join(lines)
+        print(result)
+        return result
+
+    def __repr__(self) -> str:  # pragma: no cover
         return (
-            f"SelectiveHEConfig(layers_to_encrypt={self.layers_to_encrypt}, "
-            f"operations_to_encrypt={self.operations_to_encrypt}, "
-            f"encryption_granularity='{self.encryption_granularity}')"
+            f"SelectiveHEConfig("
+            f"layers={self.layers_to_encrypt}, "
+            f"granularity={self.encryption_granularity!r})"
         )
 
 
-# ============================================================================
-# EXAMPLE CONFIGURATIONS FOR STRATEGIES 1-3
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Example configurations  (Strategies 1 – 3)
+# ---------------------------------------------------------------------------
 
-# NOTE: Layer names must match the actual model's named_modules() output
-# For TinyGPT model, the structure is:
-#   - blocks.0, blocks.1, ... (transformer blocks)
-#   - blocks.{i}.attention (attention sub-layer)
-#   - blocks.{i}.ffn (feed-forward sub-layer)
-#   - blocks.{i}.ln1, blocks.{i}.ln2 (layer norms)
-#   - lm_head (language modeling head)
-#   - embedding, ln_f (embedding and final layer norm)
-#
-# To find valid layer names for YOUR model, run:
-#   for name, _ in model.named_modules():
-#       print(name)
-
-# STRATEGY 1: Encrypt only first block's attention (minimal overhead)
-STRATEGY_1_CONFIG = {
-    "layers_to_encrypt": ["blocks.0.attention"],
-    "operations_to_encrypt": {},
-    "encryption_granularity": "layer"
+STRATEGY_1_JSON = """\
+{
+  "layers_to_encrypt": [
+    "lm_head"
+  ],
+  "operations_to_encrypt": {},
+  "encryption_granularity": "layer"
 }
+"""
+"""
+Strategy 1 – Minimal / output-only encryption.
+Encrypt only the final projection (lm_head) at layer granularity.
+Lowest compute overhead; protects only the model's final predictions.
+"""
 
-# STRATEGY 2: Encrypt attention and FFN in first two blocks (balanced)
-STRATEGY_2_CONFIG = {
-    "layers_to_encrypt": ["blocks.0.attention", "blocks.0.ffn", "blocks.1.attention", "blocks.1.ffn"],
-    "operations_to_encrypt": {},
-    "encryption_granularity": "layer"
+STRATEGY_2_JSON = """\
+{
+  "layers_to_encrypt": [
+    "attention_output",
+    "ffn_output",
+    "lm_head"
+  ],
+  "operations_to_encrypt": {
+    "attention_output": ["matmul"],
+    "ffn_output": ["matmul"],
+    "lm_head": ["matmul"]
+  },
+  "encryption_granularity": "operation"
 }
+"""
+"""
+Strategy 2 – Balanced / matmul-only encryption.
+Encrypts the most sensitive linear operations (matrix multiplications) in the
+three critical layer types.  Skips non-linear ops (softmax, gelu) which are
+expensive to evaluate under HE.
+"""
 
-# STRATEGY 3: Encrypt all blocks and language modeling head (maximum security, high overhead)
-STRATEGY_3_CONFIG = {
-    "layers_to_encrypt": ["blocks.0.attention", "blocks.0.ffn", "blocks.1.attention", "blocks.1.ffn", "lm_head"],
-    "operations_to_encrypt": {
-        "blocks.0.attention": ["matmul", "softmax"],
-        "blocks.0.ffn": ["matmul", "gelu"],
-        "blocks.1.attention": ["matmul", "softmax"],
-        "blocks.1.ffn": ["matmul", "gelu"],
-        "lm_head": ["matmul"]
-    },
-    "encryption_granularity": "operation"
+STRATEGY_3_JSON = """\
+{
+  "layers_to_encrypt": [
+    "query_proj",
+    "key_proj",
+    "value_proj",
+    "attention_output",
+    "mlp_fc1",
+    "mlp_fc2",
+    "ffn_output",
+    "lm_head"
+  ],
+  "operations_to_encrypt": {},
+  "encryption_granularity": "layer"
 }
+"""
+"""
+Strategy 3 – Maximum / full-model encryption.
+Encrypts all projections, attention outputs, and feed-forward layers at layer
+granularity.  Highest privacy guarantee; significant compute cost.
+"""
 
 
-# ============================================================================
-# UTILITY FUNCTIONS FOR WORKING WITH EXAMPLE CONFIGS
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Quick smoke-test / demo
+# ---------------------------------------------------------------------------
 
-def create_example_configs(output_dir: str = "he_configs") -> None:
-    """
-    Create example configuration JSON files for all three strategies.
-    
-    Args:
-        output_dir: Directory to save the example configurations
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    configs = {
-        "strategy_1_attention_only.json": STRATEGY_1_CONFIG,
-        "strategy_2_attention_ffn.json": STRATEGY_2_CONFIG,
-        "strategy_3_full_encryption.json": STRATEGY_3_CONFIG,
-    }
-    
-    for filename, config in configs.items():
-        filepath = output_path / filename
-        with open(filepath, 'w') as f:
-            json.dump(config, f, indent=2)
-        print(f"✓ Created {filepath}")
+def _demo() -> None:
+    import tempfile, os
 
+    configs = [
+        ("Strategy 1 – Output-only", STRATEGY_1_JSON),
+        ("Strategy 2 – Balanced matmul", STRATEGY_2_JSON),
+        ("Strategy 3 – Full model", STRATEGY_3_JSON),
+    ]
 
-def load_strategy_config(strategy: int) -> SelectiveHEConfig:
-    """
-    Load a predefined strategy configuration.
-    
-    Args:
-        strategy: Strategy number (1, 2, or 3)
-        
-    Returns:
-        SelectiveHEConfig instance
-        
-    Raises:
-        ValueError: If strategy is not 1, 2, or 3
-    """
-    strategies = {
-        1: STRATEGY_1_CONFIG,
-        2: STRATEGY_2_CONFIG,
-        3: STRATEGY_3_CONFIG,
-    }
-    
-    if strategy not in strategies:
-        raise ValueError(f"Strategy must be 1, 2, or 3, got {strategy}")
-    
-    config_dict = strategies[strategy]
-    return SelectiveHEConfig(
-        layers_to_encrypt=config_dict["layers_to_encrypt"],
-        operations_to_encrypt=config_dict["operations_to_encrypt"],
-        encryption_granularity=config_dict["encryption_granularity"]
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for name, blob in configs:
+            print(f"\n{'='*60}")
+            print(f"  {name}")
+            print(f"{'='*60}")
+
+            # Write JSON → load → summarise
+            json_path = os.path.join(tmpdir, "cfg.json")
+            Path(json_path).write_text(blob, encoding="utf-8")
+            cfg = SelectiveHEConfig.from_json(json_path)
+            cfg.summary()
+
+            # Round-trip serialisation check
+            out_path = os.path.join(tmpdir, "out.json")
+            cfg.to_json(out_path)
+            reloaded = SelectiveHEConfig.from_json(out_path)
+            assert reloaded.to_dict() == cfg.to_dict(), "Round-trip mismatch!"
+            print("  ✓ JSON round-trip OK")
 
 
 if __name__ == "__main__":
-    # Example usage
-    print("\n--- Creating Example Configurations ---")
-    create_example_configs()
-    
-    print("\n--- Loading and Summarizing Strategy 1 ---")
-    config1 = load_strategy_config(1)
-    config1.summary()
-    
-    print("\n--- Loading and Summarizing Strategy 2 ---")
-    config2 = load_strategy_config(2)
-    config2.summary()
-    
-    print("\n--- Loading and Summarizing Strategy 3 ---")
-    config3 = load_strategy_config(3)
-    config3.summary()
+    _demo()
