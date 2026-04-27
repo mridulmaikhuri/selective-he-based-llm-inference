@@ -1,491 +1,709 @@
+#!/usr/bin/env python3
+"""
+benchmarks.py
+=============
+Timing, perplexity, and memory profiling utilities for HE-encrypted
+and plaintext transformer inference.
+
+Functions
+---------
+  warmup_runs(model, inputs, method, n_runs)
+    Run model forward passes to stabilize performance (warm cache)
+
+  time_inference(model, inputs, method, n_runs, include_warmup)
+    Measure inference latency (TTFT, per-token, throughput, stats)
+
+  compute_perplexity(model, val_dataset, method)
+    Compute perplexity on validation split
+
+  memory_profiling(model, method)
+    Report peak RAM / VRAM usage + ciphertext size estimates
+
+  set_reproducibility_seeds(seed)
+    Set seeds for deterministic results
+
+  print_benchmark_summary(results_dict, method)
+    Print compact summary of timing results
+"""
+
+from __future__ import annotations
+
+import gc
 import time
-import math
-import os
-import random
-from typing import Any, Callable, Dict, Iterable, List, Tuple, Union
+import warnings
+from typing import Callable, Dict, List, Optional, Tuple, Any
 
-import torch
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Try to import CUDA/GPU utilities
+try:
+    import torch.cuda
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except Exception:
+    CUDA_AVAILABLE = False
+
+# Try to import psutil for memory monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    warnings.warn("psutil not installed; memory profiling will be limited")
+
+# Try to import HE libraries
+try:
+    from Pyfhel import Pyfhel
+    from he_utils import setup_HE_context
+    HE_AVAILABLE = True
+except ImportError:
+    HE_AVAILABLE = False
 
 
-TensorOrList = Union[torch.Tensor, Iterable[torch.Tensor]]
+# ═══════════════════════════════════════════════════════════════════════════
+# 1.  Reproducibility
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-def set_random_seeds(seed: int = 42, deterministic: bool = False) -> None:
+def set_reproducibility_seeds(seed: int = 42) -> None:
     """
-    Set random seeds for reproducible benchmarks.
+    Set all relevant seeds for reproducible results.
 
-    This controls Python, NumPy and PyTorch RNGs. For fully reproducible
-    CUDA results you may also need to set environment flags outside Python.
+    Parameters
+    ----------
+    seed : int
+        Random seed to use globally.
     """
-    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if CUDA_AVAILABLE:
+        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
-    if deterministic:
-        torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
-        torch.backends.cudnn.benchmark = False  # type: ignore[attr-defined]
-
-
-def _model_uses_cuda(model: torch.nn.Module) -> bool:
-    return any(p.is_cuda for p in model.parameters())
+        # Deterministic algorithms may impact performance
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
 
 
-def _maybe_synchronize_cuda(model: torch.nn.Module) -> None:
-    if torch.cuda.is_available() and _model_uses_cuda(model):
-        torch.cuda.synchronize()
-
-
-def _ensure_tensor_iter(inputs: TensorOrList) -> List[torch.Tensor]:
-    if isinstance(inputs, torch.Tensor):
-        return [inputs]
-    return list(inputs)
-
-
-def _infer_plain(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-    with torch.no_grad():
-        return model(x)
-
-
-def _build_method_inference(
-    model: torch.nn.Module,
-    method: str,
-) -> Tuple[Callable[[torch.Tensor], torch.Tensor], Dict[str, Any]]:
-    """
-    Return a callable that runs one forward pass according to `method`.
-
-    Additional metadata useful for memory profiling can be returned in
-    the second element of the tuple.
-    """
-    method = method.lower()
-
-    if method == "plain":
-        def _infer_plain_closure(x: torch.Tensor) -> torch.Tensor:
-            return _infer_plain(model, x)
-
-        return _infer_plain_closure, {}
-
-    # Selective HE strategies: strategy1 / strategy2 / strategy3
-    if method.startswith("strategy"):
-        from selective_he_config import load_strategy_config
-        from he_utils import setup_HE_context
-        from selective_he_engine import selective_HE_inference
-
-        try:
-            strategy_id = int(method.replace("strategy", ""))
-        except ValueError as exc:
-            raise ValueError(f"Unsupported method '{method}'.") from exc
-
-        config = load_strategy_config(strategy_id)
-        config.validate(model)
-        HE = setup_HE_context(n=2 ** 14, t=65537)
-
-        def _infer_he(x: torch.Tensor) -> torch.Tensor:
-            logits, _, _ = selective_HE_inference(
-                model, x, HE, config, verbose=False
-            )
-            return logits
-
-        meta = {"he_config": config, "he_context": HE, "he_type": "selective"}
-        return _infer_he, meta
-
-    # Full HE pipeline for ToyTransformer (he_inference.full_he_inference)
-    if method in {"full_he", "he_full"}:
-        from he_utils import setup_HE_context
-        from he_inference import full_he_inference
-
-        HE = setup_HE_context(n=2 ** 14, t=65537)
-
-        def _infer_full_he(x: torch.Tensor) -> torch.Tensor:
-            # full_he_inference returns (top_5_tokens, timings, memory_info)
-            _, _, _ = full_he_inference(model, x, HE)
-            # For timing interfaces that expect logits, we just return
-            # a dummy tensor with the correct batch dimension.
-            return torch.empty(0)
-
-        meta = {"he_context": HE, "he_type": "full"}
-        return _infer_full_he, meta
-
-    raise ValueError(f"Unknown inference method '{method}'.")
-
+# ═══════════════════════════════════════════════════════════════════════════
+# 2.  Warm-up utilities
+# ═══════════════════════════════════════════════════════════════════════════
 
 def warmup_runs(
-    model: torch.nn.Module,
-    inputs: TensorOrList,
-    method: str = "plain",
-    n_warmup: int = 3,
+    model:   nn.Module,
+    inputs:  torch.Tensor,
+    method:  str = "plain",
+    n_runs:  int = 3,
+    HE:      Optional[Pyfhel] = None,
+    inference_fn: Optional[Callable] = None,
 ) -> None:
     """
-    Run a few warm-up passes to stabilize caches and JITs.
+    Run model forward passes to warm up cache and stabilize timing.
+
+    Parameters
+    ----------
+    model : nn.Module
+        PyTorch model in eval mode.
+    inputs : torch.Tensor
+        Input tensor (typically (1, seq_len) for LM).
+    method : str
+        Inference method ('plain', 'strategy1', 'strategy2', 'strategy3').
+    n_runs : int
+        Number of warm-up iterations (default 3).
+    HE : Pyfhel, optional
+        HE context if using encrypted methods.
+    inference_fn : callable, optional
+        Custom inference function signature:
+          inference_fn(model, inputs, HE, **kwargs) -> (logits, timings, ...)
     """
     model.eval()
-    input_list = _ensure_tensor_iter(inputs)
-    infer_fn, meta = _build_method_inference(model, method)
+    with torch.no_grad():
+        for _ in range(n_runs):
+            if method == "plain":
+                _ = model(inputs)
+            elif inference_fn is not None:
+                _ = inference_fn(model, inputs, HE)
+            else:
+                _ = model(inputs)
 
-    for _ in range(max(0, n_warmup)):
-        for x in input_list:
-            try:
-                _ = infer_fn(x)
-            except ValueError as e:
-                # Skip warmup for methods that have unsupported configurations
-                # (e.g., full HE with large d_model)
-                if "full HE" in str(e) or "too large" in str(e):
-                    # Log warning instead of crashing
-                    import logging
-                    logging.warning(f"Skipping warmup for method '{method}': {e}")
-                    return
-                else:
-                    raise
-    _maybe_synchronize_cuda(model)
+    if CUDA_AVAILABLE:
+        torch.cuda.synchronize()
+    gc.collect()
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3.  Inference timing
+# ═══════════════════════════════════════════════════════════════════════════
 
 def time_inference(
-    model: torch.nn.Module,
-    inputs: TensorOrList,
-    method: str = "plain",
-    n_runs: int = 10,
+    model:        nn.Module,
+    inputs:       torch.Tensor,
+    method:       str = "plain",
+    n_runs:       int = 10,
+    include_warmup: bool = True,
+    HE:           Optional[Pyfhel] = None,
+    inference_fn: Optional[Callable] = None,
+    verbose:      bool = True,
 ) -> Dict[str, Any]:
     """
-    Benchmark inference latency.
+    Measure inference latency, throughput, and statistics.
 
-    Returns a dict with:
-        - TTFT: float, time to first token (ms, approximated)
-        - avg_latency_per_token: float (ms/token)
-        - throughput: float (tokens/sec)
-        - stats: dict with mean/std/min/max latency in ms
+    Measures:
+      • TTFT (Time to First Token): First output token time
+      • Avg latency per token: Total time / sequence length
+      • Throughput: Tokens per second
+      • Statistics: mean, std, min, max latencies
+
+    Parameters
+    ----------
+    model : nn.Module
+        PyTorch model in eval mode.
+    inputs : torch.Tensor
+        Input tensor, shape (batch, seq_len) for LM.
+    method : str
+        Inference method ('plain', 'strategy1', 'strategy2', 'strategy3').
+    n_runs : int
+        Number of timing runs (default 10).
+    include_warmup : bool
+        If True, run warm-up iterations first (default True).
+    HE : Pyfhel, optional
+        HE context if using encrypted methods.
+    inference_fn : callable, optional
+        Custom inference function; if None, calls model(inputs).
+    verbose : bool
+        If True, print summary to stdout (default True).
+
+    Returns
+    -------
+    results : dict
+        Keys:
+          'ttft_ms'              : Time to first token (ms)
+          'latency_per_token_ms' : Avg latency per token (ms)
+          'throughput_tokens_sec': Tokens per second
+          'mean_latency_ms'      : Mean total latency (ms)
+          'std_latency_ms'       : Std dev of latencies (ms)
+          'min_latency_ms'       : Min latency (ms)
+          'max_latency_ms'       : Max latency (ms)
+          'n_runs'               : Number of timing runs
+          'seq_len'              : Sequence length of inputs
+          'method'               : Inference method used
     """
     model.eval()
-    if n_runs <= 0:
-        raise ValueError("n_runs must be > 0.")
 
-    input_list = _ensure_tensor_iter(inputs)
-    infer_fn, _ = _build_method_inference(model, method)
+    if include_warmup:
+        warmup_runs(model, inputs, method, n_runs=3, HE=HE, inference_fn=inference_fn)
 
-    # Warm-up (un-timed but synchronized)
-    warmup_runs(model, input_list, method=method, n_warmup=2)
+    # Sequence length
+    if isinstance(inputs, torch.Tensor):
+        seq_len = inputs.shape[1] if len(inputs.shape) > 1 else inputs.shape[0]
+    else:
+        seq_len = 1
 
-    latencies_ms: List[float] = []
-    total_tokens = 0
+    latencies = []
 
-    for run_idx in range(n_runs):
-        for x in input_list:
-            # Estimate token count from final dimension before vocab
-            if x.dim() == 2:
-                total_tokens += int(x.numel())
-            else:
-                total_tokens += int(x.shape[0] * x.shape[1])
+    with torch.no_grad():
+        for _ in range(n_runs):
+            if CUDA_AVAILABLE:
+                torch.cuda.synchronize()
 
-            _maybe_synchronize_cuda(model)
             t0 = time.perf_counter()
-            try:
-                _ = infer_fn(x)
-            except ValueError as e:
-                # Handle unsupported HE configurations
-                if "full HE" in str(e) or "too large" in str(e):
-                    import logging
-                    logging.error(f"Method '{method}' failed: {e}")
-                    # Return error result
-                    return {
-                        "status": "error",
-                        "method": method,
-                        "error": str(e),
-                        "TTFT": float('inf'),
-                        "avg_latency_per_token": float('inf'),
-                        "throughput": 0.0,
-                        "stats": {
-                            "mean_ms": float('inf'),
-                            "std_ms": 0.0,
-                            "min_ms": float('inf'),
-                            "max_ms": float('inf')
-                        }
-                    }
-                else:
-                    raise
-            _maybe_synchronize_cuda(model)
-            t1 = time.perf_counter()
+            if method == "plain":
+                logits = model(inputs)
+            elif inference_fn is not None:
+                logits, _, _ = inference_fn(model, inputs, HE)
+            else:
+                logits = model(inputs)
 
-            lat_ms = (t1 - t0) * 1000.0
-            latencies_ms.append(lat_ms)
+            if CUDA_AVAILABLE:
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
 
-    lat_arr = np.array(latencies_ms, dtype=np.float64)
-    mean_ms = float(lat_arr.mean())
-    std_ms = float(lat_arr.std(ddof=0))
-    min_ms = float(lat_arr.min())
-    max_ms = float(lat_arr.max())
+            latencies.append(elapsed)
 
-    # Approximate TTFT as latency of first run divided by sequence length.
-    first_latency_ms = latencies_ms[0]
-    first_tokens = max(1, total_tokens // len(latencies_ms))
-    ttft_ms = first_latency_ms / first_tokens
+    latencies = np.array(latencies) * 1e3  # Convert to ms
 
-    avg_latency_per_token_ms = mean_ms / max(1, first_tokens)
-    total_time_s = float(lat_arr.sum() / 1000.0)
-    throughput = (total_tokens / total_time_s) if total_time_s > 0 else 0.0
+    # Compute metrics
+    ttft_ms = latencies[0]  # Approximation: full latency as TTFT
+    mean_latency = float(np.mean(latencies))
+    std_latency = float(np.std(latencies))
+    min_latency = float(np.min(latencies))
+    max_latency = float(np.max(latencies))
 
-    result: Dict[str, Any] = {
-        "TTFT": float(ttft_ms),
-        "avg_latency_per_token": float(avg_latency_per_token_ms),
-        "throughput": float(throughput),
-        "stats": {
-            "mean_ms": mean_ms,
-            "std_ms": std_ms,
-            "min_ms": min_ms,
-            "max_ms": max_ms,
-        },
+    latency_per_token = mean_latency / max(seq_len, 1)
+    throughput = 1000.0 / latency_per_token if latency_per_token > 0 else 0.0
+
+    results = {
+        "ttft_ms":               ttft_ms,
+        "latency_per_token_ms":  latency_per_token,
+        "throughput_tokens_sec": throughput,
+        "mean_latency_ms":       mean_latency,
+        "std_latency_ms":        std_latency,
+        "min_latency_ms":        min_latency,
+        "max_latency_ms":        max_latency,
+        "n_runs":                n_runs,
+        "seq_len":               seq_len,
+        "method":                method,
     }
 
-    print(
-        f"[time_inference] method={method} "
-        f"runs={len(latencies_ms)} "
-        f"mean={mean_ms:.3f}ms "
-        f"ttft≈{ttft_ms:.3f}ms "
-        f"throughput={throughput:.2f} tok/s"
-    )
+    if verbose:
+        print_benchmark_summary(results, method)
 
-    return result
+    return results
 
 
-@torch.no_grad()
+# ═══════════════════════════════════════════════════════════════════════════
+# 4.  Perplexity computation
+# ═══════════════════════════════════════════════════════════════════════════
+
 def compute_perplexity(
-    model: torch.nn.Module,
-    val_dataset: Any,
-    method: str = "plain",
-    batch_size: int = 8,
-    ignore_index: int = 0,
+    model:        nn.Module,
+    val_dataset:  List[torch.Tensor] | torch.Tensor,
+    method:       str = "plain",
+    HE:           Optional[Pyfhel] = None,
+    inference_fn: Optional[Callable] = None,
+    batch_size:   int = 1,
+    verbose:      bool = True,
 ) -> float:
     """
-    Compute perplexity on a validation split using method-specific inference.
+    Compute perplexity on validation dataset.
 
-    `val_dataset` can be a `torch.utils.data.Dataset` of (x, y) pairs or
-    an existing `DataLoader`. For HE methods, selective HE inference is
-    used where available.
+    Perplexity = exp(mean cross-entropy loss) over all tokens.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Language model in eval mode.
+    val_dataset : list of tensors or single tensor
+        Validation input IDs. If list, each item is (1, seq_len).
+        If single tensor, shape (n_samples, seq_len).
+    method : str
+        Inference method ('plain', 'strategy1', 'strategy2', 'strategy3').
+    HE : Pyfhel, optional
+        HE context if using encrypted methods.
+    inference_fn : callable, optional
+        Custom inference function.
+    batch_size : int
+        Batch size for evaluation (default 1; HE requires batch_size=1).
+    verbose : bool
+        If True, print perplexity (default True).
+
+    Returns
+    -------
+    perplexity : float
+        Perplexity score (lower is better).
     """
-    from torch.utils.data import DataLoader
-    import torch.nn.functional as F
-
     model.eval()
-    device = next(model.parameters()).device
 
-    if isinstance(val_dataset, DataLoader):
-        val_loader = val_dataset
+    # Convert dataset to list if needed
+    if isinstance(val_dataset, torch.Tensor):
+        if len(val_dataset.shape) == 2:
+            # (n_samples, seq_len) -> list of (1, seq_len)
+            val_list = [val_dataset[i:i+1] for i in range(val_dataset.shape[0])]
+        else:
+            val_list = [val_dataset]
     else:
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-    infer_fn, _ = _build_method_inference(model, method)
+        val_list = val_dataset
 
     total_loss = 0.0
     total_tokens = 0
 
-    for batch in val_loader:
-        if isinstance(batch, (list, tuple)) and len(batch) == 2:
-            x, y = batch
-        else:
-            # Assume language-model style where y is next-token shifted version of x
-            x = batch
-            if isinstance(x, torch.Tensor):
-                y = x[:, 1:].clone()
-                x = x[:, :-1].clone()
+    with torch.no_grad():
+        for i, batch in enumerate(val_list):
+            if isinstance(batch, torch.Tensor):
+                input_ids = batch
             else:
-                raise ValueError("Unsupported batch format for perplexity computation.")
+                continue
 
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-            y = y.unsqueeze(0)
+            # Ensure shape is (batch, seq_len)
+            if len(input_ids.shape) == 1:
+                input_ids = input_ids.unsqueeze(0)
 
-        x = x.to(device)
-        y = y.to(device)
+            # Get logits
+            if method == "plain":
+                logits = model(input_ids)  # (batch, seq_len, vocab_size)
+            elif inference_fn is not None:
+                logits, _, _ = inference_fn(model, input_ids, HE)
+            else:
+                logits = model(input_ids)
 
-        logits = infer_fn(x)
-        if logits.numel() == 0:
-            raise RuntimeError(
-                "Inference method did not return logits; cannot compute perplexity."
+            # Compute cross-entropy loss (shift: predict next token)
+            # input_ids: (batch, seq_len) -> logits: (batch, seq_len, vocab_size)
+            # We predict tokens[1:] from tokens[:-1]
+            shift_logits = logits[:, :-1, :].contiguous()  # (batch, seq_len-1, vocab_size)
+            shift_labels = input_ids[:, 1:].contiguous()   # (batch, seq_len-1)
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.shape[-1]),
+                shift_labels.view(-1),
+                reduction="sum"
             )
 
-        logits = logits.view(-1, logits.size(-1))
-        targets = y.view(-1)
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
 
-        loss = F.cross_entropy(
-            logits, targets, reduction="sum", ignore_index=ignore_index
-        )
-        nonpad = (targets != ignore_index).sum().item()
-        total_loss += loss.item()
-        total_tokens += nonpad
+    # Perplexity = exp(avg_loss)
+    if total_tokens == 0:
+        perplexity = float('inf')
+    else:
+        avg_loss = total_loss / total_tokens
+        perplexity = float(np.exp(avg_loss))
 
-    avg_loss = total_loss / total_tokens if total_tokens > 0 else math.inf
-    ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
+    if verbose:
+        print(f"  Perplexity ({method}): {perplexity:.4f}  (avg_loss={avg_loss:.4f})")
 
-    print(
-        f"[compute_perplexity] method={method} "
-        f"loss={avg_loss:.4f} ppl={ppl:.2f} tokens={total_tokens}"
-    )
-    return float(ppl)
+    return perplexity
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5.  Memory profiling
+# ═══════════════════════════════════════════════════════════════════════════
 
 def memory_profiling(
-    model: torch.nn.Module,
-    method: str = "plain",
-    sample_input: torch.Tensor | None = None,
-) -> Dict[str, Any]:
+    model:       nn.Module,
+    method:      str = "plain",
+    HE:          Optional[Pyfhel] = None,
+    sample_input: Optional[torch.Tensor] = None,
+    verbose:     bool = True,
+) -> Dict[str, float]:
     """
-    Profile peak RAM and VRAM usage for a single inference run.
+    Profile peak memory usage (RAM and VRAM if available).
 
-    For HE methods, also estimates ciphertext memory footprint where possible.
+    Estimates:
+      • Peak RAM: Process resident set size (if psutil available)
+      • Peak VRAM: GPU memory (if CUDA available)
+      • Ciphertext size: Approximate HE ciphertext size (for HE methods)
+
+    Parameters
+    ----------
+    model : nn.Module
+        PyTorch model.
+    method : str
+        Inference method ('plain', 'strategy1', 'strategy2', 'strategy3').
+    HE : Pyfhel, optional
+        HE context (used to estimate ciphertext size).
+    sample_input : torch.Tensor, optional
+        Sample input for forward pass (if None, skipped).
+    verbose : bool
+        If True, print memory summary (default True).
+
+    Returns
+    -------
+    memory : dict
+        Keys:
+          'peak_ram_mb'       : Peak RAM usage (MB)
+          'peak_vram_mb'      : Peak VRAM usage (MB)
+          'model_size_mb'     : Model parameters (MB)
+          'ciphertext_size_mb': Estimated ciphertext size (MB)
     """
-    import psutil
-
-    model.eval()
-    infer_fn, meta = _build_method_inference(model, method)
-
-    device = next(model.parameters()).device
-    if sample_input is None:
-        seq_len = getattr(model, "max_len", 16)
-        vocab_size = getattr(model, "vocab_size", 256)
-        sample_input = torch.randint(
-            0, vocab_size, (1, seq_len), dtype=torch.long, device=device
-        )
-    else:
-        sample_input = sample_input.to(device)
-
-    # Reset CUDA peak stats if applicable
-    if torch.cuda.is_available() and _model_uses_cuda(model):
-        torch.cuda.reset_peak_memory_stats(device)
-
-    process = psutil.Process(os.getpid())
-    ram_before = process.memory_info().rss
-
-    _maybe_synchronize_cuda(model)
-    t0 = time.perf_counter()
-    try:
-        _ = infer_fn(sample_input)
-    except ValueError as e:
-        # Handle unsupported HE configurations
-        if "full HE" in str(e) or "too large" in str(e):
-            import logging
-            logging.error(f"Method '{method}' failed in memory profiling: {e}")
-            # Return error result
-            return {
-                "status": "error",
-                "method": method,
-                "error": str(e),
-                "elapsed_ms": float('inf'),
-                "peak_ram_mb": 0.0,
-                "peak_vram_mb": 0.0,
-                "he_num_ciphertexts_est": 0,
-                "he_ciphertext_memory_mb": 0.0,
-            }
-        else:
-            raise
-    _maybe_synchronize_cuda(model)
-    t1 = time.perf_counter()
-
-    ram_after = process.memory_info().rss
-    peak_ram_bytes = max(ram_before, ram_after) - ram_before
-    peak_ram_mb = peak_ram_bytes / (1024 ** 2)
-
-    if torch.cuda.is_available() and _model_uses_cuda(model):
-        peak_vram_bytes = torch.cuda.max_memory_allocated(device)
-    else:
-        peak_vram_bytes = 0
-    peak_vram_mb = peak_vram_bytes / (1024 ** 2)
-
-    he_ciphertexts_est = 0
-    he_ciphertext_mb = 0.0
-
-    # If full HE pipeline exposes memory info, re-use its estimate.
-    if meta.get("he_type") == "full":
-        from he_utils import setup_HE_context
-        from he_inference import full_he_inference
-
-        try:
-            HE = setup_HE_context(n=2 ** 14, t=65537)
-            _, _, mem_info = full_he_inference(model, sample_input, HE)
-            he_ciphertexts_est = int(mem_info.get("peak_ciphertexts", 0))
-            he_ciphertext_mb = float(mem_info.get("est_ciphertext_size_mb", 0.0))
-        except ValueError as e:
-            # Full HE not supported for this model size - log and continue
-            import logging
-            logging.warning(f"Full HE memory profiling skipped: {e}")
-            he_ciphertexts_est = 0
-            he_ciphertext_mb = 0.0
-    elif meta.get("he_type") == "selective":
-        # Very rough estimate based on sequence length and hidden size.
-        seq_len = sample_input.shape[1]
-        d_model = getattr(model, "d_model", 64)
-        # Assume ~3 ciphertexts per hidden unit for encrypted layers on average.
-        he_ciphertexts_est = int(3 * seq_len * d_model)
-        he_ciphertext_mb = he_ciphertexts_est / 1024.0  # ~1KB per ct → MB
-
-    elapsed_ms = (t1 - t0) * 1000.0
-
-    result = {
-        "elapsed_ms": float(elapsed_ms),
-        "peak_ram_mb": float(max(peak_ram_mb, 0.0)),
-        "peak_vram_mb": float(max(peak_vram_mb, 0.0)),
-        "he_num_ciphertexts_est": int(he_ciphertexts_est),
-        "he_ciphertext_memory_mb": float(he_ciphertext_mb),
+    results = {
+        "peak_ram_mb":       0.0,
+        "peak_vram_mb":      0.0,
+        "model_size_mb":     0.0,
+        "ciphertext_size_mb": 0.0,
     }
 
-    print(
-        f"[memory_profiling] method={method} "
-        f"time={elapsed_ms:.2f}ms "
-        f"RAM≈{result['peak_ram_mb']:.2f}MB "
-        f"VRAM≈{result['peak_vram_mb']:.2f}MB "
-        f"HE_ct≈{he_ciphertexts_est} (~{he_ciphertext_mb:.2f}MB)"
-    )
+    # Model size
+    model_size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    results["model_size_mb"] = model_size_bytes / (1024 ** 2)
 
-    return result
+    # RAM profiling (if psutil available)
+    if PSUTIL_AVAILABLE:
+        process = psutil.Process()
+        gc.collect()
+        ram_before = process.memory_info().rss / (1024 ** 2)
+
+        if sample_input is not None:
+            with torch.no_grad():
+                _ = model(sample_input)
+
+        ram_after = process.memory_info().rss / (1024 ** 2)
+        results["peak_ram_mb"] = max(ram_before, ram_after)
+
+    # VRAM profiling (if CUDA available)
+    if CUDA_AVAILABLE:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+        if sample_input is not None:
+            with torch.no_grad():
+                _ = model(sample_input.cuda() if not sample_input.is_cuda else sample_input)
+            torch.cuda.synchronize()
+
+        peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        results["peak_vram_mb"] = peak_vram
+
+    # Ciphertext size estimate (for HE methods)
+    if method in ("strategy1", "strategy2", "strategy3") and HE is not None:
+        # Rough estimate: ciphertext is ~10x plaintext size in BFV (conservative)
+        # Encrypted tensors per method:
+        #   Strategy 1: (seq_len, d_model) × 1 layer × n_layers
+        #   Strategy 2: (seq_len, d_model) × n_params in last block + lm_head
+        #   Strategy 3: (vocab_size, d_model) + (d_model, vocab_size) for embedding & lm_head
+        # Very rough: 10x plaintext
+        ciphertext_multiplier = 10.0  # Conservative estimate
+        results["ciphertext_size_mb"] = results["model_size_mb"] * ciphertext_multiplier
+
+    if verbose:
+        print(f"\n  Memory Profiling ({method})")
+        print(f"  {'─'*50}")
+        print(f"    Model size           : {results['model_size_mb']:>10.2f} MB")
+        if results["peak_ram_mb"] > 0:
+            print(f"    Peak RAM usage       : {results['peak_ram_mb']:>10.2f} MB")
+        if results["peak_vram_mb"] > 0:
+            print(f"    Peak VRAM usage      : {results['peak_vram_mb']:>10.2f} MB")
+        if results["ciphertext_size_mb"] > 0:
+            print(f"    Est. ciphertext size : {results['ciphertext_size_mb']:>10.2f} MB")
+        print(f"  {'─'*50}")
+
+    return results
 
 
-__all__ = [
-    "set_random_seeds",
-    "warmup_runs",
-    "time_inference",
-    "compute_perplexity",
-    "memory_profiling",
-]
+# ═══════════════════════════════════════════════════════════════════════════
+# 6.  Reporting utilities
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-def main() -> None:
+def print_benchmark_summary(results: Dict[str, Any], method: str) -> None:
     """
-    Simple CLI entrypoint for quick manual benchmarking.
+    Print a compact summary of benchmark results.
 
-    Example:
-        python benchmarks.py
+    Parameters
+    ----------
+    results : dict
+        Output from time_inference() or similar.
+    method : str
+        Name of the inference method.
     """
-    from model import TinyGPT
+    print(f"\n  Benchmark Summary ({method})")
+    print(f"  {'─'*60}")
+    print(f"    TTFT                : {results.get('ttft_ms', 0):>10.2f} ms")
+    print(f"    Latency/token       : {results.get('latency_per_token_ms', 0):>10.2f} ms")
+    print(f"    Throughput          : {results.get('throughput_tokens_sec', 0):>10.2f} tok/s")
+    print(f"    Mean latency        : {results.get('mean_latency_ms', 0):>10.2f} ms  "
+          f"± {results.get('std_latency_ms', 0):.2f}")
+    print(f"    Min / Max           : {results.get('min_latency_ms', 0):>10.2f} / "
+          f"{results.get('max_latency_ms', 0):>10.2f} ms")
+    print(f"    Runs                : {results.get('n_runs', 0):>10} × "
+          f"{results.get('seq_len', 0)} tokens")
+    print(f"  {'─'*60}")
 
-    set_random_seeds(42)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[benchmarks] Using device: {device}")
+def compare_benchmarks(
+    results_dict: Dict[str, Dict[str, Any]],
+    metric: str = "mean_latency_ms",
+) -> None:
+    """
+    Print a side-by-side comparison of benchmark results across methods.
 
-    model = TinyGPT(
-        num_layers=2,
-        vocab_size=256,
-        d_model=64,
-        num_heads=4,
-        d_ff=256,
-        max_len=64,
-        dropout=0.1,
-    ).to(device)
-    model.eval()
+    Parameters
+    ----------
+    results_dict : dict
+        Mapping from method name to results dict (from time_inference).
+    metric : str
+        Metric to compare (default 'mean_latency_ms').
+    """
+    if not results_dict:
+        return
 
-    # Dummy input for quick smoke-test
-    seq_len = 16
-    inputs = torch.randint(0, model.vocab_size, (1, seq_len), dtype=torch.long, device=device)
+    print(f"\n  Benchmark Comparison ({metric})")
+    print(f"  {'─'*70}")
+    print(f"  {'Method':<20}  {metric:<25}  {'Relative':<15}")
+    print(f"  {'─'*70}")
 
-    print("\n=== Timing (plain) ===")
-    timing = time_inference(model, inputs, method="plain", n_runs=5)
-    print(timing)
+    # Find baseline (first method or 'plain')
+    baseline_method = next(iter(results_dict.keys()))
+    if "plain" in results_dict:
+        baseline_method = "plain"
+    baseline_value = results_dict[baseline_method].get(metric, 1.0)
 
-    print("\n=== Memory (plain) ===")
-    mem = memory_profiling(model, method="plain", sample_input=inputs)
-    print(mem)
+    for method, results in results_dict.items():
+        value = results.get(metric, 0.0)
+        relative = value / baseline_value if baseline_value > 0 else 1.0
+        rel_str = f"{relative:.2f}× baseline"
+        print(f"  {method:<20}  {value:>24.2f}  {rel_str:>15}")
 
+    print(f"  {'─'*70}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7.  Integration helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def benchmark_all_methods(
+    model:        nn.Module,
+    inputs:       torch.Tensor,
+    val_dataset:  Optional[List[torch.Tensor]] = None,
+    methods:      List[str] = None,
+    HE:           Optional[Pyfhel] = None,
+    inference_fns: Dict[str, Callable] = None,
+    n_runs:       int = 10,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Run benchmarks (timing + perplexity) across all methods.
+
+    Parameters
+    ----------
+    model : nn.Module
+        PyTorch model.
+    inputs : torch.Tensor
+        Sample input for timing.
+    val_dataset : list of tensors, optional
+        Validation data for perplexity.
+    methods : list of str, optional
+        Methods to benchmark (default: ['plain', 'strategy1', 'strategy2', 'strategy3']).
+    HE : Pyfhel, optional
+        HE context for encrypted methods.
+    inference_fns : dict, optional
+        Mapping from method name to inference function.
+    n_runs : int
+        Timing runs per method (default 10).
+
+    Returns
+    -------
+    all_results : dict
+        Mapping from method → results dict.
+    """
+    if methods is None:
+        methods = ["plain", "strategy1", "strategy2", "strategy3"]
+    if inference_fns is None:
+        inference_fns = {}
+
+    all_results = {}
+
+    for method in methods:
+        print(f"\n  Benchmarking {method} …")
+        timing_results = time_inference(
+            model, inputs, method=method, n_runs=n_runs,
+            HE=HE, inference_fn=inference_fns.get(method),
+            verbose=True
+        )
+        all_results[method] = timing_results
+
+        if val_dataset is not None:
+            compute_perplexity(
+                model, val_dataset, method=method,
+                HE=HE, inference_fn=inference_fns.get(method),
+                verbose=True
+            )
+
+    return all_results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8.  Example usage (if run directly)
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    main()
+    print("╔" + "═" * 68 + "╗")
+    print("║" + " " * 15 + "benchmarks.py — Inference Timing & Profiling" + " " * 9 + "║")
+    print("╚" + "═" * 68 + "╝")
 
+    # ── 1. Set reproducibility ────────────────────────────────────────────────
+    print("\n[1] Setting reproducibility seeds …")
+    set_reproducibility_seeds(42)
+    print("    ✓ Seeds set for reproducible results")
 
+    # ── 2. Create a minimal test model ────────────────────────────────────────
+    print("\n[2] Creating test model …")
+    
+    class TinyLM(nn.Module):
+        """Minimal language model for demonstration."""
+        def __init__(self, vocab_size=128, d_model=32, seq_len=8):
+            super().__init__()
+            self.embed = nn.Embedding(vocab_size, d_model)
+            self.pos_embed = nn.Embedding(seq_len, d_model)
+            self.fc1 = nn.Linear(d_model, 64)
+            self.fc2 = nn.Linear(64, vocab_size)
+            
+        def forward(self, input_ids):
+            B, S = input_ids.shape
+            pos = torch.arange(S, device=input_ids.device).unsqueeze(0)
+            x = self.embed(input_ids) + self.pos_embed(pos)
+            x = F.relu(self.fc1(x))
+            logits = self.fc2(x)
+            return logits
+    
+    model = TinyLM(vocab_size=128, d_model=32, seq_len=8)
+    model.eval()
+    print(f"    ✓ Model created: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+    # ── 3. Create test inputs ─────────────────────────────────────────────────
+    print("\n[3] Creating test inputs …")
+    test_input = torch.randint(0, 128, (1, 8), dtype=torch.long)
+    val_data = [torch.randint(0, 128, (1, 8), dtype=torch.long) for _ in range(5)]
+    print(f"    ✓ Test input shape: {test_input.shape}")
+    print(f"    ✓ Validation dataset: {len(val_data)} samples")
+
+    # ── 4. Warm-up runs ──────────────────────────────────────────────────────
+    print("\n[4] Running warm-up iterations …")
+    warmup_runs(model, test_input, method="plain", n_runs=2)
+    print("    ✓ Warm-up complete (cache stabilized)")
+
+    # ── 5. Time inference ────────────────────────────────────────────────────
+    print("\n[5] Benchmarking inference latency …")
+    timing_results = time_inference(
+        model, test_input,
+        method="plain",
+        n_runs=10,
+        include_warmup=False,
+        verbose=True
+    )
+
+    # ── 6. Perplexity computation ────────────────────────────────────────────
+    print("\n[6] Computing perplexity on validation data …")
+    perplexity = compute_perplexity(
+        model, val_data,
+        method="plain",
+        verbose=True
+    )
+
+    # ── 7. Memory profiling ──────────────────────────────────────────────────
+    print("\n[7] Profiling memory usage …")
+    memory_results = memory_profiling(
+        model,
+        method="plain",
+        sample_input=test_input,
+        verbose=True
+    )
+
+    # ── 8. Compare benchmarks (simulate multiple methods) ───────────────────
+    print("\n[8] Comparing benchmark results across methods …")
+    # Create synthetic results for other "methods"
+    timing_results_dict = {
+        "plain": timing_results,
+        "method_2x": {**timing_results, "mean_latency_ms": timing_results["mean_latency_ms"] * 2},
+        "method_3x": {**timing_results, "mean_latency_ms": timing_results["mean_latency_ms"] * 3},
+    }
+    compare_benchmarks(timing_results_dict, metric="mean_latency_ms")
+
+    # ── 9. Function summary ──────────────────────────────────────────────────
+    print("\n[9] Available Functions Summary")
+    print("╔" + "═" * 68 + "╗")
+    functions_info = [
+        ("set_reproducibility_seeds(seed)", "Set seeds for reproducible results"),
+        ("warmup_runs(model, inputs, method, ...)", "Warm up cache before timing"),
+        ("time_inference(model, inputs, method, ...)", "Measure latency & throughput"),
+        ("compute_perplexity(model, val_dataset, ...)", "Compute perplexity on validation"),
+        ("memory_profiling(model, method, ...)", "Profile RAM/VRAM usage"),
+        ("print_benchmark_summary(results, method)", "Print formatted timing summary"),
+        ("compare_benchmarks(results_dict, metric)", "Compare across methods"),
+        ("benchmark_all_methods(model, inputs, ...)", "Benchmark all methods together"),
+    ]
+    
+    for func_sig, description in functions_info:
+        print(f"║  {func_sig:<42}  {description:<24}║")
+    
+    print("╚" + "═" * 68 + "╝")
+
+    # ── 10. Return values ────────────────────────────────────────────────────
+    print("\n[10] Return Value Examples")
+    print("╔" + "═" * 68 + "╗")
+    print("║  time_inference() returns dict with keys:                         ║")
+    print(f"║    {str(list(timing_results.keys())):<65}║")
+    print("║                                                                    ║")
+    print("║  memory_profiling() returns dict with keys:                       ║")
+    print(f"║    {str(list(memory_results.keys())):<65}║")
+    print("║                                                                    ║")
+    print(f"║  compute_perplexity() returns float: {perplexity:.4f}                     ║")
+    print("╚" + "═" * 68 + "╝")
+
+    print("\n✓ All benchmarking functions demonstrated successfully!\n")

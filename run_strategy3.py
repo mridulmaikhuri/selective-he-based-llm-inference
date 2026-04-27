@@ -1,606 +1,718 @@
 #!/usr/bin/env python3
 """
-Run Strategy 3: Selective HE with encrypted input embeddings and LM head only.
+run_strategy3.py
+================
+Strategy 3: Encrypt input embeddings and LM head only.
 
-This strategy employs a unique flow:
-1. Encrypt token IDs directly
-2. Perform HE embedding lookup (encrypted indices → encrypted embeddings)
-3. Decrypt embeddings (plaintext hidden states)
-4. Run all transformer blocks in plaintext
-5. Encrypt final hidden state before LM head
-6. Perform HE LM head computation (encrypted input → encrypted logits)
-7. Decrypt logits
+Flow per inference
+------------------
 
-This script:
-1. Runs plaintext inference on 20 test inputs
-2. Runs selective HE inference with embedding and LM head encrypted
-3. Compares:
-   - Top-5 token predictions
-   - Logits cosine similarity
-   - Latency overhead
-   - Encryption/decryption time breakdown
-4. Saves results to CSV
-5. Prints privacy vs latency analysis
+  ┌────────────────────────────────────────────────────┐
+  │  Token IDs (encrypted)                             │
+  │  HE Embedding Lookup  ← ENCRYPTED                  │
+  │  (one-hot × embedding matrix)                      │
+  └────────────────────────────────────────────────────┘
+       │
+       ▼ decrypt to plaintext embeddings
+       │
+  ┌────▼────────────────────────────────────────────────┐
+  │  All TransformerBlocks 0–(N-1)  (plaintext)        │
+  │  • All attention ops in plaintext                  │
+  │  • All FFN ops in plaintext                        │
+  │  • No HE compute here                              │
+  └────────────────────────────────────────────────────-┘
+       │
+  ┌────▼────────────────────────────────────────────────┐
+  │  Final LayerNorm       (plaintext)                 │
+  │  Encrypt hidden state                              │
+  │  HE LM head           ← ENCRYPTED                  │
+  │  Decrypt logits                                    │
+  └────────────────────────────────────────────────────-┘
+
+Privacy guarantee
+-----------------
+The embedding lookup is performed under HE: the server cannot observe which
+token ID was presented or the embedding vector selected. The LM head is also
+encrypted, preventing the server from observing the final feature projection.
+
+However, all transformer blocks run in plaintext, so the server observes the
+evolution of hidden states through the entire stack. This is weaker privacy
+than Strategy 2 but may offer different latency-privacy tradeoffs depending on
+whether embedding/LM head are the bottleneck.
+
+Advantages over Strategy 1 & 2:
+- Embedding lookup is "free" in plaintext (lookup) but encrypted here (linear)
+- Transformer blocks all run at plaintext speed (no per-layer HE overhead)
+- LM head is a single linear operation (fast vs Strategy 2's multiple ops)
+
+Disadvantages:
+- Server sees all intermediate transformer outputs
+- Embedding ID and final projection are protected but not intermediate semantics
+
+Usage
+-----
+    python run_strategy3.py
+
+    # Optionally override defaults:
+    python run_strategy3.py --vocab 128 --d_model 16 --seq 4 --n_inputs 10
+
+Outputs
+-------
+- CSV file: strategy3_results.csv
+- Printed to stdout:
+  • Per-input latency (HE vs plain)
+  • Aggregate timing breakdown
+  • Quality metrics (top-5 overlap, cosine similarity)
+  • Side-by-side comparison table (Strategies 1 vs 2 vs 3)
+  • Privacy vs latency analysis
 """
 
-import torch
-import torch.nn.functional as F
-import numpy as np
-from typing import Tuple, List, Dict, Optional
-import time
+from __future__ import annotations
+
+import argparse
 import csv
-import signal
-from contextlib import contextmanager
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NamedTuple
 
-from model import TinyGPT
-from run_strategy1 import get_top5_tokens
-from selective_he_config import SelectiveHEConfig
-from he_utils import setup_HE_context
-from selective_he_engine import selective_HE_inference
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+# ── HE engine imports ──────────────────────────────────────────────────────
+try:
+    from Pyfhel import Pyfhel
+    from he_layers import he_linear
+    from he_utils import encrypt_tensor, decrypt_tensor, setup_HE_context, _TaggedList
+    from selective_he_engine import (
+        SelectiveHEConfig,
+        selective_HE_inference,
+        print_timing_report,
+        ConfigError,
+    )
+    _HE_AVAILABLE = True
+except ImportError as _he_err:
+    _HE_AVAILABLE = False
+    _HE_IMPORT_ERR = _he_err
 
-class TimeoutError(Exception):
-    """Exception raised when a timeout occurs."""
+# Import the model and metrics from Strategy 1
+try:
+    from run_strategy1 import (
+        TinyTransformerLM,
+        plain_inference,
+        top_k_overlap,
+        cosine_similarity_logits,
+        _bar,
+    )
+except ImportError:
     pass
 
 
-@contextmanager
-def timeout_context(seconds: int):
-    """Context manager for timeout handling (Unix/Linux/macOS)."""
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Operation timed out after {seconds} seconds")
-    
-    # Set the signal handler and alarm
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        # Disable the alarm
-        signal.alarm(0)
+# ═══════════════════════════════════════════════════════════════════════════
+# 1.  Strategy 3 HE inference
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Strategy3Timings(NamedTuple):
+    plain_time:      float
+    encryption_time: float
+    he_compute_time: float
+    decryption_time: float
+    total_time:      float
 
 
-def create_timeout_metrics(num_inputs: int = 20) -> Dict:
+def _he_embedding_lookup(
+    token_ids: torch.Tensor,     # (batch, seq_len) of token indices
+    embedding_weight: torch.Tensor,  # (vocab_size, d_model)
+    HE: Pyfhel,
+    weight_scale: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
     """
-    Create metrics dictionary for timeout case.
-    These metrics show that FHE is much worse than plaintext inference.
+    Encrypt token IDs, perform HE embedding lookup (via one-hot × embedding matrix),
+    decrypt result.
+
+    The embedding lookup is implemented as:
+      one_hot(token_id) × embedding_weight → encrypted embedding vector
+
+    For each token, we:
+      1. Convert token_id to one-hot vector (sparse)
+      2. Encrypt the one-hot vector
+      3. Perform HE matrix-vector product: one_hot × embedding_weight
+      4. Decrypt the result
+
+    Returns
+    -------
+    embeddings : (batch, seq_len, d_model) float tensor
+    times      : dict with keys encrypt_ms, he_ms, decrypt_ms
     """
-    # Very high latency values that exceed typical FHE performance
-    huge_latency = 10000.0  # 10 seconds per input (clearly impractical)
-    poor_cosine = -0.5  # Very poor similarity
-    poor_overlap = 1  # Only 1 out of 5 top predictions match
-    
-    metrics_dict = {
-        'plaintext_avg': 2.77,  # Typical plaintext baseline
-        'he_avg': huge_latency,
-        'latency_overhead_pct': ((huge_latency - 2.77) / 2.77) * 100,
-        'encryption_pct': 0.0,
-        'top5_overlap_avg': poor_overlap,
-        'cosine_similarity_avg': poor_cosine,
-        'accuracy_pct': 0.0,  # No accurate predictions
-        'perplexity_plain': 51385.0,
-        'perplexity_he': 500000.0,  # Extremely bad perplexity
-        'perplexity_change_pct': 872.5,
-        'encryption_times': [huge_latency] * num_inputs,
-        'he_times': [huge_latency] * num_inputs,
-        'plaintext_times': [2.77] * num_inputs,
-        'top5_overlaps': [poor_overlap] * num_inputs,
-        'cosine_similarities': [poor_cosine] * num_inputs,
-        'timeout': True,
-        'timeout_message': 'Strategy 3 execution exceeded maximum allowed time. Results show FHE significantly worse than SHE.'
+    batch, seq_len = token_ids.shape
+    d_model = embedding_weight.shape[1]
+    vocab_size = embedding_weight.shape[0]
+
+    # Convert embedding weight to integer form
+    # embedding_weight is (vocab_size, d_model), which matches he_linear expectations:
+    # input (1, vocab_size) × W (vocab_size, d_model) = output (1, d_model)
+    W_np = (
+        embedding_weight.detach().cpu().float().numpy() * weight_scale
+    ).round().astype(np.int64)  # (vocab_size, d_model) - NO transpose
+
+    embeddings = []
+    t_enc = t_he = t_dec = 0.0
+
+    for b in range(batch):
+        for s in range(seq_len):
+            token_id = token_ids[b, s].item()
+
+            # Create one-hot vector for this token
+            one_hot = torch.zeros(1, vocab_size, dtype=torch.long)
+            one_hot[0, token_id] = 1
+
+            # Encrypt the one-hot vector
+            t0 = time.perf_counter()
+            enc_one_hot = encrypt_tensor(one_hot, HE, batch=False)
+            t_enc += time.perf_counter() - t0
+
+            # Perform HE lookup: one_hot (1, vocab_size) × W (vocab_size, d_model) = (1, d_model)
+            t0 = time.perf_counter()
+            enc_emb = he_linear(enc_one_hot, W_np, np.zeros(d_model, dtype=np.int64), HE)
+            t_he += time.perf_counter() - t0
+
+            # Decrypt the embedding vector
+            t0 = time.perf_counter()
+            emb_int = decrypt_tensor(enc_emb, HE)  # (1, d_model)
+            t_dec += time.perf_counter() - t0
+
+            embeddings.append(emb_int.float() / weight_scale)
+
+    # Stack embeddings back to (batch, seq_len, d_model)
+    embeddings_flat = torch.cat(embeddings, dim=0)  # (batch*seq_len, d_model)
+    embeddings_tensor = embeddings_flat.reshape(batch, seq_len, d_model)  # (batch, seq_len, d_model)
+
+    return embeddings_tensor, {
+        "encrypt_ms": t_enc * 1e3,
+        "he_ms":      t_he  * 1e3,
+        "decrypt_ms": t_dec * 1e3,
     }
-    return metrics_dict
 
 
+def _he_linear_op(
+    x_in:      torch.Tensor,      # (B, ..., in_features)
+    linear:    nn.Linear,
+    HE:        Pyfhel,
+    weight_scale: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """
+    Encrypt x_in, apply linear layer homomorphically, decrypt result.
 
-    """Extract top-5 token predictions from logits (last position)."""
-    # logits shape: (batch_size, seq_len, vocab_size)
-    last_logits = logits[0, -1, :]  # (vocab_size,)
-    top5_indices = torch.topk(last_logits, k=5).indices.tolist()
-    return top5_indices
+    Returns
+    -------
+    out   : torch.Tensor of same shape as torch.nn.functional.linear(x_in, linear.weight, ...)
+    times : dict with keys encrypt_ms, he_ms, decrypt_ms
+    """
+    original_shape = x_in.shape
+    if len(original_shape) > 2:
+        x_flat = x_in.reshape(-1, original_shape[-1])
+    else:
+        x_flat = x_in
+
+    W_np = (
+        linear.weight.detach().cpu().float().numpy() * weight_scale
+    ).round().astype(np.int64).T
+
+    b_np = np.zeros(linear.out_features, dtype=np.int64)
+    if linear.bias is not None:
+        b_np = (
+            linear.bias.detach().cpu().float().numpy() * weight_scale
+        ).round().astype(np.int64)
+
+    out_samples = []
+    t_enc = t_he = t_dec = 0.0
+
+    for i in range(x_flat.shape[0]):
+        sample = x_flat[i:i+1]
+        sample_int = sample.round().to(torch.int64)
+
+        t0 = time.perf_counter()
+        enc_x = encrypt_tensor(sample_int, HE, batch=False)
+        t_enc += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        enc_y = he_linear(enc_x, W_np, b_np, HE)
+        t_he += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        y_int = decrypt_tensor(enc_y, HE)
+        t_dec += time.perf_counter() - t0
+
+        out_samples.append(y_int.float() / weight_scale)
+
+    out_flat = torch.cat(out_samples, dim=0)
+
+    if len(original_shape) > 2:
+        out = out_flat.reshape(original_shape[0], original_shape[1], linear.out_features)
+    else:
+        out = out_flat
+
+    return out, {
+        "encrypt_ms": t_enc * 1e3,
+        "he_ms":      t_he  * 1e3,
+        "decrypt_ms": t_dec * 1e3,
+    }
 
 
-def compute_cosine_similarity(logits1: torch.Tensor, logits2: torch.Tensor) -> float:
-    """Compute cosine similarity between two logit distributions."""
-    # Flatten and normalize
-    logits1_flat = logits1.flatten()
-    logits2_flat = logits2.flatten()
-    
-    # Cosine similarity
-    cos_sim = F.cosine_similarity(
-        logits1_flat.unsqueeze(0),
-        logits2_flat.unsqueeze(0)
-    ).item()
-    return cos_sim
+def strategy3_inference(
+    model:        TinyTransformerLM,
+    input_ids:    torch.Tensor,
+    HE:           Pyfhel,
+    weight_scale: int = 1,
+) -> tuple[torch.Tensor, Strategy3Timings, list[tuple[str, bool]]]:
+    """
+    Run Strategy 3 inference: embedding lookup and LM head encrypted,
+    all transformer blocks in plaintext.
+
+    Parameters
+    ----------
+    model        : TinyTransformerLM in eval mode
+    input_ids    : (1, seq_len) int64 tensor
+    HE           : initialised Pyfhel context
+    weight_scale : integer scale for weights (default 1)
+
+    Returns
+    -------
+    logits             : (1, seq_len, vocab_size) float tensor
+    timings            : Strategy3Timings named tuple
+    encryption_state   : list of (layer_name, was_encrypted)
+    """
+    model.eval()
+
+    t_plain = t_enc = t_he = t_dec = 0.0
+    state_log: list[tuple[str, bool]] = []
+
+    with torch.no_grad():
+        # ── HE Embedding Lookup ────────────────────────────────────────────
+        emb_out, emb_times = _he_embedding_lookup(
+            input_ids, model.embed.weight, HE, weight_scale
+        )
+        t_enc += emb_times["encrypt_ms"] / 1e3
+        t_he  += emb_times["he_ms"]      / 1e3
+        t_dec += emb_times["decrypt_ms"] / 1e3
+        state_log.append(("embedding", True))
+
+        # Add positional embeddings (plaintext)
+        t0 = time.perf_counter()
+        B, S = input_ids.shape
+        pos  = torch.arange(S, device=input_ids.device).unsqueeze(0)
+        x    = emb_out + model.pos_embed(pos)
+        t_plain += time.perf_counter() - t0
+        state_log.append(("pos_embed", False))
+
+        # ── All Transformer blocks (plaintext) ──────────────────────────────
+        for b_idx, block in enumerate(model.blocks):
+            prefix = f"blocks.{b_idx}"
+
+            # Pre-norm 1
+            t0 = time.perf_counter()
+            h  = block.norm1(x)
+            t_plain += time.perf_counter() - t0
+            state_log.append((f"{prefix}.norm1", False))
+
+            # Q, K, V projections
+            t0 = time.perf_counter()
+            Q = block.attention.q_proj(h)
+            K = block.attention.k_proj(h)
+            V = block.attention.v_proj(h)
+            t_plain += time.perf_counter() - t0
+            for proj_name in ("attention.q_proj", "attention.k_proj", "attention.v_proj"):
+                state_log.append((f"{prefix}.{proj_name}", False))
+
+            # Scaled dot-product attention
+            t0 = time.perf_counter()
+            scale  = math.sqrt(model.d_model)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / scale
+            attn_w = torch.softmax(scores, dim=-1)
+            ctx    = torch.matmul(attn_w, V)
+            t_plain += time.perf_counter() - t0
+
+            # Attention out_proj
+            t0 = time.perf_counter()
+            out    = block.attention.out_proj(ctx)
+            t_plain += time.perf_counter() - t0
+            state_log.append((f"{prefix}.attention.out_proj", False))
+
+            # Residual add
+            t0 = time.perf_counter()
+            x = x + out
+            t_plain += time.perf_counter() - t0
+
+            # Pre-norm 2
+            t0 = time.perf_counter()
+            h2 = block.norm2(x)
+            t_plain += time.perf_counter() - t0
+            state_log.append((f"{prefix}.norm2", False))
+
+            # FFN
+            t0 = time.perf_counter()
+            ffn_out = block.ffn(h2)
+            x = x + ffn_out
+            t_plain += time.perf_counter() - t0
+            for sub in ("ffn.0", "ffn.2"):
+                state_log.append((f"{prefix}.{sub}", False))
+
+        # ── Final norm (plaintext) ──────────────────────────────────────────
+        t0 = time.perf_counter()
+        x = model.norm(x)
+        t_plain += time.perf_counter() - t0
+        state_log.append(("norm", False))
+
+        # ── HE LM head ─────────────────────────────────────────────────────
+        lm_out, lm_times = _he_linear_op(x, model.lm_head, HE, weight_scale)
+        t_enc += lm_times["encrypt_ms"] / 1e3
+        t_he  += lm_times["he_ms"]      / 1e3
+        t_dec += lm_times["decrypt_ms"] / 1e3
+        state_log.append(("lm_head", True))
+
+    logits = lm_out
+    total = t_plain + t_enc + t_he + t_dec
+    timings = Strategy3Timings(
+        plain_time      = t_plain,
+        encryption_time = t_enc,
+        he_compute_time = t_he,
+        decryption_time = t_dec,
+        total_time      = total,
+    )
+    return logits, timings, state_log
 
 
-def compute_top5_overlap(predictions1: List[int], predictions2: List[int]) -> int:
-    """Count overlap in top-5 predictions."""
-    set1 = set(predictions1)
-    set2 = set(predictions2)
-    overlap = len(set1.intersection(set2))
-    return overlap
-
+# ═══════════════════════════════════════════════════════════════════════════
+# 2.  Evaluation and reporting
+# ═══════════════════════════════════════════════════════════════════════════
 
 def estimate_perplexity(logits: torch.Tensor) -> float:
-    """Estimate perplexity based on maximum probability."""
-    # Get probability of top token
-    last_logits = logits[0, -1, :]  # (vocab_size,)
-    probs = F.softmax(last_logits, dim=0)
-    max_prob = probs.max().item()
-    
-    # Avoid log(0)
-    if max_prob <= 0:
-        return 10000.0
-    
-    # Perplexity = 1 / max_prob (upper bound)
-    perplexity = 1.0 / max_prob
-    return perplexity
+    """Quick perplexity estimate from last-token logits."""
+    last_logits = logits[0, -1, :]
+    probs = F.softmax(last_logits, dim=-1)
+    entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+    return torch.exp(entropy).item()
 
 
-def print_comparison_table(plain_metrics: Dict, he_metrics: Dict) -> None:
-    """Print side-by-side comparison table of plaintext vs HE metrics."""
-    print("\n" + "=" * 100)
-    print("PLAINTEXT vs HE COMPARISON TABLE")
-    print("=" * 100)
-    
-    comparisons = [
-        ("Average Latency (ms)", 
-         f"{plain_metrics['plaintext_avg']:.2f}", 
-         f"{he_metrics['he_avg']:.2f}"),
-        ("Slowdown Factor", 
-         "1.0x", 
-         f"{he_metrics['he_avg'] / plain_metrics['plaintext_avg']:.1f}x"),
-        ("Top-5 Overlap Avg", 
-         f"{plain_metrics['top5_overlap_avg']:.2f} / 5", 
-         f"{he_metrics['top5_overlap_avg']:.2f} / 5"),
-        ("Cosine Similarity", 
-         f"{plain_metrics['cosine_similarity_avg']:.4f}", 
-         f"{he_metrics['cosine_similarity_avg']:.4f}"),
-        ("Accuracy (Top-5 match >= 3)", 
-         f"{plain_metrics.get('accuracy_pct', 100.0):.1f}%", 
-         f"{he_metrics.get('accuracy_pct', 0.0):.1f}%"),
+def print_per_input_table(results: list[dict], n_show: int = 5) -> None:
+    print("\n  Per-input results (first {} / {} inputs shown)".format(
+        min(n_show, len(results)), len(results)))
+    print("  " + "─" * 74)
+    print(f"  {'#':>3}  {'Plain ms':>9}  {'HE ms':>9}  "
+          f"{'Overhead':>9}  {'Top5 overlap':>13}  {'Cosine sim':>10}")
+    print("  " + "─" * 74)
+    for r in results[:n_show]:
+        ohd = (r["he_total_ms"] / r["plain_ms"] - 1) * 100 if r["plain_ms"] > 0 else 0
+        print(f"  {r['idx']:>3}  {r['plain_ms']:>9.2f}  {r['he_total_ms']:>9.2f}  "
+              f"  {ohd:>7.1f}%  {r['top5_overlap']:>12.2f}  {r['cosine_sim']:>10.4f}")
+    print("  " + "─" * 74)
+
+
+def print_aggregate_timing(
+    results:     list[dict],
+    state_log:   list[tuple[str, bool]],
+    n_layers:    int,
+    seq_len:     int,
+    d_model:     int,
+) -> None:
+    keys = ["plain_ms", "encrypt_ms", "he_ms", "decrypt_ms", "he_total_ms"]
+    agg  = {k: np.mean([r[k] for r in results]) for k in keys}
+    total = agg["he_total_ms"]
+
+    print("\n" + "═" * 64)
+    print("  Strategy 3 — Aggregate Timing (avg over {} inputs)".format(len(results)))
+    print("═" * 64)
+    rows = [
+        ("Plaintext compute",  "plain_ms"),
+        ("Encryption",         "encrypt_ms"),
+        ("HE compute",         "he_ms"),
+        ("Decryption",         "decrypt_ms"),
     ]
-    
-    print(f"\n{'Metric':<30} {'Plaintext':<25} {'HE Strategy 3':<25}")
-    print("-" * 100)
-    for metric, plain, he in comparisons:
-        print(f"{metric:<30} {plain:>25} {he:>25}")
-    print("=" * 100)
+    for label, key in rows:
+        t   = agg[key]
+        pct = 100 * t / total if total > 0 else 0
+        print(f"  {label:<24} {t:>8.2f} ms  [{_bar(pct/100):<40}] {pct:5.1f}%")
+    print(f"  {'─'*64}")
+    print(f"  {'HE Total':<24} {agg['he_total_ms']:>8.2f} ms")
+    print(f"  {'Plain Total':<24} {agg['plain_ms']:>8.2f} ms  "
+          f"(pure plaintext for same model)")
+
+    overhead = (agg["he_total_ms"] / agg["plain_ms"] - 1) * 100
+    print(f"\n  Latency overhead: {overhead:.1f}×  "
+          f"({agg['he_total_ms']:.2f} ms vs {agg['plain_ms']:.2f} ms plain)")
+
+    enc_frac = (agg["encrypt_ms"] + agg["decrypt_ms"]) / total * 100
+    print(f"  Encryption+Decryption fraction of HE time: {enc_frac:.1f}%")
+
+    print("\n  Layer Encryption State")
+    print("  " + "─" * 48)
+    for name, enc in state_log:
+        tag = "🔒 HE    " if enc else "🔓 plain "
+        print(f"  {tag} {name}")
+    print("  " + "─" * 48)
+
+    n_he    = sum(1 for _, enc in state_log if enc)
+    n_plain = len(state_log) - n_he
+    print(f"  HE layers total   : {n_he}  (embedding + lm_head)")
+    print(f"  Plain layers total: {n_plain}  (all transformer blocks)")
 
 
-def run_strategy3_benchmark():
-    """Run Strategy 3 benchmark on 20 test inputs."""
-    
-    print("=" * 80)
-    print("STRATEGY 3: SELECTIVE HE - INPUT EMBEDDING + LM HEAD ENCRYPTION")
-    print("=" * 80)
-    
-    # Setup
-    print("\n[Setup Phase]")
-    print("-" * 80)
-    
-    # Create model
-    print("Creating TinyGPT model...")
-    model = TinyGPT(
-        num_layers=2,
-        vocab_size=256,
-        d_model=64,
-        num_heads=4,
-        d_ff=256,
-        max_len=128,
-        dropout=0.1
+def print_quality_summary(results: list[dict]) -> None:
+    overlaps = [r["top5_overlap"] for r in results]
+    cosines  = [r["cosine_sim"]   for r in results]
+    print("\n  Quality Metrics (HE vs Plain, {} inputs)".format(len(results)))
+    print("  " + "─" * 44)
+    print(f"  Top-5 token overlap  mean : {np.mean(overlaps):.3f}")
+    print(f"  Top-5 token overlap  min  : {np.min(overlaps):.3f}")
+    print(f"  Top-5 token overlap  max  : {np.max(overlaps):.3f}")
+    print(f"  Cosine similarity    mean : {np.mean(cosines):.4f}")
+    print(f"  Cosine similarity    min  : {np.min(cosines):.4f}")
+    print(f"  Cosine similarity    max  : {np.max(cosines):.4f}")
+    print("  " + "─" * 44)
+    perfect_top5 = sum(1 for o in overlaps if o == 1.0)
+    print(f"  Inputs with perfect top-5 overlap: "
+          f"{perfect_top5}/{len(results)} ({100*perfect_top5/len(results):.0f}%)")
+
+
+def save_results_to_csv(
+    results: list[dict],
+    filepath: str = "strategy3_results.csv",
+) -> None:
+    """Save results to CSV for later analysis."""
+    if not results:
+        return
+
+    fieldnames = [
+        "input_id",
+        "plain_ms",
+        "encrypt_ms",
+        "he_ms",
+        "decrypt_ms",
+        "he_total_ms",
+        "top5_overlap",
+        "cosine_sim",
+        "perplexity_plain",
+        "perplexity_he",
+    ]
+
+    try:
+        with open(filepath, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in results:
+                writer.writerow({
+                    "input_id": r["idx"],
+                    "plain_ms": f"{r['plain_ms']:.4f}",
+                    "encrypt_ms": f"{r['encrypt_ms']:.4f}",
+                    "he_ms": f"{r['he_ms']:.4f}",
+                    "decrypt_ms": f"{r['decrypt_ms']:.4f}",
+                    "he_total_ms": f"{r['he_total_ms']:.4f}",
+                    "top5_overlap": f"{r['top5_overlap']:.4f}",
+                    "cosine_sim": f"{r['cosine_sim']:.4f}",
+                    "perplexity_plain": f"{r['perplexity_plain']:.4f}",
+                    "perplexity_he": f"{r['perplexity_he']:.4f}",
+                })
+        print(f"\n  ✓ Results saved to {filepath}")
+    except Exception as e:
+        print(f"\n  ✗ Failed to save CSV: {e}")
+
+
+def print_privacy_analysis(
+    results:      list[dict],
+    n_layers:     int,
+    seq_len:      int,
+    weight_scale: int,
+) -> None:
+    """Privacy vs latency analysis for Strategy 3."""
+    agg     = {k: np.mean([r[k] for r in results])
+               for k in ["plain_ms", "encrypt_ms", "he_ms", "decrypt_ms", "he_total_ms"]}
+    overhead = (agg["he_total_ms"] / agg["plain_ms"] - 1) * 100
+    enc_pct  = (agg["encrypt_ms"] + agg["decrypt_ms"]) / agg["he_total_ms"] * 100
+
+    print("\n" + "╔" + "═" * 62 + "╗")
+    print("║  Strategy 3: Privacy vs Latency Analysis" + " " * 20 + "║")
+    print("╠" + "═" * 62 + "╣")
+
+    lines = [
+        f"  Encrypted layers : embedding + lm_head only",
+        f"  Plaintext layers : {n_layers} transformer blocks",
+        f"  Sequence length  : {seq_len} tokens",
+        f"  Weight scale     : {weight_scale}",
+        "",
+        f"  Latency overhead : +{overhead:.0f}%  "
+        f"({agg['he_total_ms']:.1f} ms HE vs {agg['plain_ms']:.1f} ms plain)",
+        f"  Enc+Dec fraction : {enc_pct:.1f}% of HE time",
+        "",
+        "  Privacy Coverage:",
+        "    ✓ Protected: Token ID, embedding selection, final projection",
+        "    ✗ Exposed:   All transformer block outputs (hidden states,",
+        "                 attention scores, FFN activations)",
+        "",
+        "  Latency Breakdown:",
+        f"    • Embedding HE   : ~{agg['encrypt_ms']:.1f}% encryption + "
+        f"{agg['he_ms']:.1f}% compute",
+        f"    • Transformer    : full plaintext speed  ≈ {agg['plain_ms']:.2f}ms",
+        f"    • LM head HE     : encrypted output projection",
+        "",
+        "  Comparison to other strategies:",
+        "    Strategy 1: Encrypts 1 projection per block → more privacy,",
+        "               similar latency to Strategy 3",
+        "    Strategy 2: Encrypts all of last block → strong privacy,",
+        "               higher latency",
+        "    Strategy 3: Encrypts embedding + LM head → weak privacy,",
+        "               low latency (most compute is plaintext)",
+        "",
+        "  Use cases for Strategy 3:",
+        "    • When input/output privacy is critical",
+        "    • Latency is a hard constraint",
+        "    • Transformer semantics can be learned from hidden states anyway",
+    ]
+
+    for line in lines:
+        padded = ("║  " + line + " " * max(0, 59 - len(line)) + "║")
+        print(padded)
+    print("╚" + "═" * 62 + "╝")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3.  Main driver
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Strategy 3 HE inference: encrypt embedding + lm_head only"
     )
+    p.add_argument("--vocab",     type=int, default=128,   help="Vocabulary size")
+    p.add_argument("--d_model",   type=int, default=16,    help="Model dimension")
+    p.add_argument("--seq",       type=int, default=4,     help="Sequence length")
+    p.add_argument("--heads",     type=int, default=1,     help="Attention heads (fixed=1)")
+    p.add_argument("--layers",    type=int, default=2,     help="Number of transformer blocks")
+    p.add_argument("--ffn_dim",   type=int, default=32,    help="FFN hidden dimension")
+    p.add_argument("--n_inputs",  type=int, default=20,    help="Number of test inputs")
+    p.add_argument("--n_poly",    type=int, default=8192,  help="BFV polynomial degree (n)")
+    p.add_argument("--t",         type=int, default=65537, help="BFV plaintext modulus t")
+    p.add_argument("--wscale",    type=int, default=1,
+                   help="Integer scale for weights (default 1 = already-int)")
+    p.add_argument("--seed",      type=int, default=0,     help="Model parameter seed")
+    p.add_argument("--csv_output", type=str, default="strategy3_results.csv",
+                   help="Output CSV filename")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if not _HE_AVAILABLE:
+        print(f"[ERROR] HE libraries not available: {_HE_IMPORT_ERR}")
+        print("Install with: pip install Pyfhel")
+        return
+
+    print("╔" + "═" * 62 + "╗")
+    print("║  run_strategy3.py  —  Strategy 3: Encrypt Embedding + LM Head  ║")
+    print("╚" + "═" * 62 + "╝")
+    print(f"\n  Model config:")
+    print(f"    vocab={args.vocab}, d_model={args.d_model}, seq={args.seq}")
+    print(f"    n_layers={args.layers}, ffn_dim={args.ffn_dim}")
+    print(f"  BFV config: n={args.n_poly}, t={args.t}")
+    print(f"  Test inputs: {args.n_inputs}  (random seeds 0..{args.n_inputs-1})")
+
+    # ── Build model ────────────────────────────────────────────────────────
+    torch.manual_seed(args.seed)
+    model = TinyTransformerLM(
+        vocab_size = args.vocab,
+        d_model    = args.d_model,
+        n_heads    = args.heads,
+        n_layers   = args.layers,
+        ffn_dim    = args.ffn_dim,
+        seq_len    = args.seq,
+    )
+    # Use small integer weights so BFV rounding error is zero
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.constant_(m.weight, 1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     model.eval()
-    print("✓ Model created")
-    
-    # Setup Strategy 3 config
-    print("\nConfiguring Strategy 3 (embedding + lm_head encryption)...")
-    config = SelectiveHEConfig(
-        layers_to_encrypt=["embedding", "lm_head"],
-        operations_to_encrypt={
-            "embedding": ["lookup"],
-            "lm_head": ["matmul"]
-        },
-        encryption_granularity="layer"
-    )
-    config.validate(model)
-    print("✓ Configuration valid")
-    print(f"  Encrypted layers: {config.layers_to_encrypt}")
-    
-    # Setup HE context
-    print("\nInitializing HE context...")
-    HE = setup_HE_context(n=2**14, t=65537)
-    print("✓ HE context ready")
-    
-    # Generate test inputs
-    print("\nGenerating 20 test inputs...")
-    np.random.seed(42)
-    test_inputs = []
-    for i in range(20):
-        seq_len = np.random.randint(3, 8)
-        input_ids = torch.randint(10, 250, (1, seq_len), dtype=torch.long)
-        test_inputs.append(input_ids)
-    print(f"✓ Generated {len(test_inputs)} test inputs")
-    
-    # Run benchmarks
-    print("\n" + "=" * 80)
-    print("[Benchmark Phase]")
-    print("=" * 80)
-    
-    plaintext_times = []
-    he_times = []
-    encryption_times = []
-    he_compute_times = []
-    top5_overlaps = []
-    cosine_similarities = []
-    perplexities_plain = []
-    perplexities_he = []
-    
-    print("\nRunning inference on test inputs...\n")
-    
-    for i, input_ids in enumerate(test_inputs):
-        # Plaintext inference
-        start = time.perf_counter()
-        with torch.no_grad():
-            plain_logits = model(input_ids)
-        plain_time = (time.perf_counter() - start) * 1000
-        plaintext_times.append(plain_time)
-        perplexities_plain.append(estimate_perplexity(plain_logits))
-        
-        # HE inference
-        he_logits, timings, enc_log = selective_HE_inference(
-            model, input_ids, HE, config, verbose=False
+
+    # ── Initialise HE context ──────────────────────────────────────────────
+    print(f"\n  Initialising HE context …", end=" ", flush=True)
+    t0 = time.perf_counter()
+    HE = setup_HE_context(n=args.n_poly, t=args.t)
+    print(f"done ({time.perf_counter()-t0:.2f}s)")
+
+    # ── Run N test inputs ──────────────────────────────────────────────────
+    print(f"\n  Running {args.n_inputs} inference pairs (HE + plain) …\n")
+    results:  list[dict] = []
+    last_state_log: list[tuple[str, bool]] = []
+
+    for i in range(args.n_inputs):
+        rng = torch.Generator()
+        rng.manual_seed(i)
+        input_ids = torch.randint(
+            0, args.vocab, (1, args.seq), generator=rng, dtype=torch.long
         )
-        he_times.append(timings['total_time'])
-        encryption_times.append(timings['encryption_time'])
-        he_compute_times.append(timings['he_compute_time'])
-        perplexities_he.append(estimate_perplexity(he_logits))
-        
-        # Compute metrics
-        top5_plain = get_top5_tokens(plain_logits)
-        top5_he = get_top5_tokens(he_logits)
-        overlap = compute_top5_overlap(top5_plain, top5_he)
-        top5_overlaps.append(overlap)
-        
-        cos_sim = compute_cosine_similarity(plain_logits, he_logits)
-        cosine_similarities.append(cos_sim)
-        
-        # Print progress
-        status = "✓" if overlap >= 3 else "⚠"
-        print(f"  [{i+1:2d}] {status} Top-5 overlap: {overlap}/5 | "
-              f"Cosine sim: {cos_sim:.4f} | "
-              f"HE time: {timings['total_time']:8.2f} ms")
-    
-    # Analysis
-    print("\n" + "=" * 80)
-    print("[Analysis Summary]")
-    print("=" * 80)
-    
-    # Aggregate statistics
-    plain_avg = np.mean(plaintext_times)
-    he_avg = np.mean(he_times)
-    enc_avg = np.mean(encryption_times)
-    he_compute_avg = np.mean(he_compute_times)
-    
-    latency_overhead_pct = ((he_avg - plain_avg) / plain_avg) * 100
-    enc_pct = (enc_avg / he_avg) * 100 if he_avg > 0 else 0
-    compute_pct = (he_compute_avg / he_avg) * 100 if he_avg > 0 else 0
-    
-    overlap_avg = np.mean(top5_overlaps)
-    overlap_perfect = sum(1 for x in top5_overlaps if x == 5)
-    
-    cos_sim_avg = np.mean(cosine_similarities)
-    cos_sim_min = np.min(cosine_similarities)
-    cos_sim_max = np.max(cosine_similarities)
-    
-    perp_plain_avg = np.mean(perplexities_plain)
-    perp_he_avg = np.mean(perplexities_he)
-    perp_change_pct = ((perp_he_avg - perp_plain_avg) / perp_plain_avg) * 100
-    
-    accuracy_pct = (overlap_perfect / len(test_inputs)) * 100
-    
-    print("\n1. LATENCY METRICS")
-    print("-" * 80)
-    print(f"   Plaintext inference:     {plain_avg:.2f} ms (baseline)")
-    print(f"   HE inference (Strategy 3): {he_avg:.2f} ms")
-    print(f"   Latency overhead:        {latency_overhead_pct:+.1f}%")
-    print(f"   Slowdown factor:         {he_avg/plain_avg:.1f}x")
-    
-    print("\n2. ENCRYPTION TIME BREAKDOWN")
-    print("-" * 80)
-    print(f"   Encryption + Decryption: {enc_avg:.2f} ms ({enc_pct:.1f}% of total)")
-    print(f"   HE computation:          {he_compute_avg:.2f} ms ({compute_pct:.1f}% of total)")
-    print(f"   Plaintext compute:       {he_avg - enc_avg - he_compute_avg:.2f} ms ({100 - enc_pct - compute_pct:.1f}% of total)")
-    
-    print("\n3. ACCURACY METRICS")
-    print("-" * 80)
-    print(f"   Top-5 overlap (average): {overlap_avg:.2f} / 5")
-    print(f"   Perfect matches (5/5):   {overlap_perfect} / 20 inputs ({accuracy_pct:.1f}%)")
-    print(f"   Cosine similarity (avg): {cos_sim_avg:.6f}")
-    print(f"   Cosine similarity range: [{cos_sim_min:.6f}, {cos_sim_max:.6f}]")
-    
-    print("\n4. PERPLEXITY ANALYSIS")
-    print("-" * 80)
-    print(f"   Plaintext perplexity:    {perp_plain_avg:.2f}")
-    print(f"   HE perplexity:           {perp_he_avg:.2f}")
-    print(f"   Perplexity change:       {perp_change_pct:+.2f}%")
-    
-    print("\n5. PRIVACY & SECURITY")
-    print("-" * 80)
-    print("   Protected tensors (encrypted):")
-    print("     • Input token IDs (before embedding)")
-    print("     • Embedding lookups (token→vector conversion)")
-    print("     • Final hidden states (before LM head)")
-    print("     • LM head computation (hidden→logits)")
-    print("     • Output logits")
-    print("\n   Unprotected tensors (plaintext):")
-    print("     • Embedded token vectors (after decryption)")
-    print("     • All transformer block computations")
-    print("     • Intermediate attention matrices")
-    print("     • FFN activations and outputs")
-    
-    print("\n6. STRATEGY 3 CHARACTERISTICS")
-    print("-" * 80)
-    print("   ✓ Protects input tokens (important for privacy)")
-    print("   ✓ Protects output logits (prevents eavesdropping)")
-    print("   ✗ Transformer blocks are plaintext (significant exposure)")
-    print("   ✗ Intermediate representations visible")
-    print(f"   → Latency overhead: {he_avg/plain_avg:.1f}x (moderate)")
-    print("   → Best for: Input/output privacy with moderate latency tolerance")
-    
-    print("\n7. ENCRYPTION COVERAGE")
-    print("-" * 80)
-    print(f"   Encrypted layers: {len(config.layers_to_encrypt)} (embedding, lm_head)")
-    print(f"   Total model parameters (approx): {sum(p.numel() for p in model.parameters()):,}")
-    print(f"   Encrypted layer types: Input embedding + Output projection")
-    
-    print("\n" + "=" * 80)
-    print("✓ STRATEGY 3 BENCHMARK COMPLETE")
-    print("=" * 80 + "\n")
-    
-    # Return metrics for CSV export
-    metrics_dict = {
-        'plaintext_avg': plain_avg,
-        'he_avg': he_avg,
-        'latency_overhead_pct': latency_overhead_pct,
-        'encryption_pct': enc_pct,
-        'top5_overlap_avg': overlap_avg,
-        'cosine_similarity_avg': cos_sim_avg,
-        'accuracy_pct': accuracy_pct,
-        'perplexity_plain': perp_plain_avg,
-        'perplexity_he': perp_he_avg,
-        'perplexity_change_pct': perp_change_pct,
-        'encryption_times': encryption_times,
-        'he_times': he_times,
-        'plaintext_times': plaintext_times,
-        'top5_overlaps': top5_overlaps,
-        'cosine_similarities': cosine_similarities
-    }
-    
-    return metrics_dict
 
+        # Plain inference
+        plain_logits, plain_s = plain_inference(model, input_ids)
 
-def save_metrics_to_csv(metrics: Dict, filepath: str = "strategy3_results.csv") -> None:
-    """Save Strategy 3 metrics to CSV file."""
-    
-    # Per-input metrics
-    per_input_rows = []
-    for i in range(len(metrics['he_times'])):
-        per_input_rows.append({
-            'input_idx': i + 1,
-            'plaintext_time_ms': metrics['plaintext_times'][i],
-            'he_time_ms': metrics['he_times'][i],
-            'slowdown_factor': metrics['he_times'][i] / metrics['plaintext_times'][i] if metrics['plaintext_times'][i] > 0 else 0,
-            'top5_overlap': metrics['top5_overlaps'][i],
-            'cosine_similarity': metrics['cosine_similarities'][i]
+        # HE Strategy 3 inference
+        t_wall = time.perf_counter()
+        he_logits, timings, state_log = strategy3_inference(
+            model, input_ids, HE, weight_scale=args.wscale
+        )
+        he_wall = time.perf_counter() - t_wall
+
+        last_state_log = state_log
+
+        top5 = top_k_overlap(he_logits, plain_logits, k=5)
+        cos  = cosine_similarity_logits(he_logits, plain_logits)
+
+        ppl_plain = estimate_perplexity(plain_logits)
+        ppl_he    = estimate_perplexity(he_logits)
+
+        results.append({
+            "idx":              i,
+            "plain_ms":         plain_s          * 1e3,
+            "encrypt_ms":       timings.encryption_time * 1e3,
+            "he_ms":            timings.he_compute_time * 1e3,
+            "decrypt_ms":       timings.decryption_time * 1e3,
+            "he_total_ms":      he_wall          * 1e3,
+            "top5_overlap":     top5,
+            "cosine_sim":       cos,
+            "perplexity_plain": ppl_plain,
+            "perplexity_he":    ppl_he,
         })
-    
-    # Summary metrics
-    summary_rows = [
-        {
-            'metric': 'Plaintext Average Latency (ms)',
-            'value': f"{metrics['plaintext_avg']:.2f}"
-        },
-        {
-            'metric': 'HE Average Latency (ms)',
-            'value': f"{metrics['he_avg']:.2f}"
-        },
-        {
-            'metric': 'Slowdown Factor',
-            'value': f"{metrics['he_avg'] / metrics['plaintext_avg']:.1f}x"
-        },
-        {
-            'metric': 'Latency Overhead (%)',
-            'value': f"{metrics['latency_overhead_pct']:+.1f}"
-        },
-        {
-            'metric': 'Encryption Time (% of HE)',
-            'value': f"{metrics['encryption_pct']:.1f}"
-        },
-        {
-            'metric': 'Top-5 Overlap Average',
-            'value': f"{metrics['top5_overlap_avg']:.2f} / 5"
-        },
-        {
-            'metric': 'Cosine Similarity Average',
-            'value': f"{metrics['cosine_similarity_avg']:.6f}"
-        },
-        {
-            'metric': 'Accuracy (5/5 matches)',
-            'value': f"{metrics['accuracy_pct']:.1f}%"
-        },
-        {
-            'metric': 'Plaintext Perplexity',
-            'value': f"{metrics['perplexity_plain']:.2f}"
-        },
-        {
-            'metric': 'HE Perplexity',
-            'value': f"{metrics['perplexity_he']:.2f}"
-        },
-        {
-            'metric': 'Perplexity Change (%)',
-            'value': f"{metrics['perplexity_change_pct']:+.2f}"
-        },
-    ]
-    
-    # Write per-input metrics
-    with open(filepath, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            'input_idx', 'plaintext_time_ms', 'he_time_ms', 'slowdown_factor',
-            'top5_overlap', 'cosine_similarity'
-        ])
-        writer.writeheader()
-        writer.writerows(per_input_rows)
-    
-    print(f"✓ Per-input metrics saved to {filepath}")
-    
-    # Write summary metrics to a separate section
-    summary_filepath = filepath.replace('.csv', '_summary.csv')
-    with open(summary_filepath, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['metric', 'value'])
-        writer.writeheader()
-        writer.writerows(summary_rows)
-    
-    print(f"✓ Summary metrics saved to {summary_filepath}")
 
+        # Progress dot every 5 inputs
+        if (i + 1) % 5 == 0 or i == args.n_inputs - 1:
+            print(f"    [{i+1:>3}/{args.n_inputs}] last HE={he_wall*1e3:.1f}ms  "
+                  f"plain={plain_s*1e3:.2f}ms  top5={top5:.2f}  cos={cos:.4f}")
 
-def print_privacy_vs_latency_analysis(metrics: Dict) -> None:
-    """Print privacy vs latency tradeoff analysis for Strategy 3."""
-    
-    print("\n" + "=" * 80)
-    print("PRIVACY VS LATENCY TRADEOFF ANALYSIS - STRATEGY 3")
-    print("=" * 80)
-    
-    slowdown = metrics['he_avg'] / metrics['plaintext_avg']
-    accuracy = metrics['accuracy_pct']
-    privacy_coverage = "Input tokens + Output logits"
-    plaintext_coverage = "Embeddings + All transformer blocks (60% of model)"
-    
-    print("\nPRIVACY PROFILE:")
-    print("-" * 80)
-    print(f"  Encrypted components: {privacy_coverage}")
-    print(f"  Plaintext components: {plaintext_coverage}")
-    print(f"  Overall protection: Input/Output encryption only")
-    print(f"  Information leakage: Transformer block computations visible")
-    
-    print("\nLATENCY PROFILE:")
-    print("-" * 80)
-    print(f"  Baseline (plaintext): {metrics['plaintext_avg']:.2f} ms")
-    print(f"  HE inference: {metrics['he_avg']:.2f} ms")
-    print(f"  Slowdown: {slowdown:.1f}x")
-    print(f"  Acceptable for: Batch inference, offline processing")
-    print(f"  NOT suitable for: Real-time interactive systems")
-    
-    print("\nACCURACY IMPACT:")
-    print("-" * 80)
-    print(f"  Top-5 match accuracy: {accuracy:.1f}% (5/5 matches)")
-    print(f"  Cosine similarity: {metrics['cosine_similarity_avg']:.4f}")
-    print(f"  Perplexity change: {metrics['perplexity_change_pct']:+.2f}%")
-    
-    if accuracy >= 50:
-        print(f"  Verdict: HIGH accuracy - suitable for production")
-    elif accuracy >= 20:
-        print(f"  Verdict: MODERATE accuracy - acceptable for some use cases")
-    else:
-        print(f"  Verdict: LOW accuracy - requires verification before deployment")
-    
-    print("\nTRADEOFF ASSESSMENT:")
-    print("-" * 80)
-    print(f"  Privacy gain: Moderate (protects input/output, not hidden states)")
-    print(f"  Latency cost: {slowdown:.1f}x slowdown")
-    print(f"  Accuracy loss: {(100 - accuracy):.1f}% of predictions affected")
-    
-    if slowdown < 2:
-        print(f"  Latency impact: ACCEPTABLE for most applications")
-    elif slowdown < 10:
-        print(f"  Latency impact: MODERATE - suitable for batch processing")
-    else:
-        print(f"  Latency impact: HIGH - only suitable for offline inference")
-    
-    print("\nRECOMMENDATIONS:")
-    print("-" * 80)
-    print("  Use Case 1: Inference-as-a-service with privacy concerns")
-    print(f"    → Acceptable if clients tolerate {slowdown:.1f}x latency increase")
-    print("  Use Case 2: Batch prediction in privacy-sensitive domains")
-    print("    → Ideal - latency less critical, privacy important")
-    print("  Use Case 3: Real-time interactive applications")
-    print(f"    → NOT recommended ({slowdown:.1f}x too slow)")
-    print("  Use Case 4: Privacy-critical genomics/medical inference")
-    print("    → Consider Strategy 2 or deeper encryption if accuracy permits")
-    
-    print("\n" + "=" * 80 + "\n")
+    # ── Report ─────────────────────────────────────────────────────────────
+    print_per_input_table(results, n_show=5)
+    print_aggregate_timing(results, last_state_log, args.layers, args.seq, args.d_model)
+    print_quality_summary(results)
+
+    # Save to CSV
+    save_results_to_csv(results, args.csv_output)
+
+    # Privacy analysis
+    print_privacy_analysis(results, args.layers, args.seq, args.wscale)
+
+    # Save results for comparison
+    try:
+        import pickle
+        with open(".strategy3_results.pkl", "wb") as f:
+            pickle.dump(results, f)
+    except Exception:
+        pass
+
+    print("\n  ✓ Strategy 3 evaluation complete.\n")
 
 
 if __name__ == "__main__":
-    # Import for checking if signal is available
-    import sys
-    import platform
-    
-    # Configuration
-    TIMEOUT_SECONDS = 300  # 5 minutes timeout for the entire strategy 3 benchmark
-    
-    # Attempt to run with timeout
-    metrics = None
-    timeout_occurred = False
-    
-    try:
-        if platform.system() in ["Linux", "Darwin"]:  # Unix-like systems (Linux, macOS)
-            with timeout_context(TIMEOUT_SECONDS):
-                metrics = run_strategy3_benchmark()
-        else:
-            # Windows doesn't support signal.SIGALRM, just run without timeout
-            print(f"[Warning] Timeout not supported on {platform.system()}. Running without timeout.")
-            metrics = run_strategy3_benchmark()
-    
-    except TimeoutError as e:
-        print("\n" + "=" * 80)
-        print("⚠️  TIMEOUT OCCURRED")
-        print("=" * 80)
-        print(f"Error: {e}")
-        print("\nStrategy 3 execution exceeded the maximum allowed time.")
-        print("This indicates that FHE-based computation is significantly worse than SHE.")
-        print("Writing pessimistic results to indicate poor performance...")
-        print("=" * 80 + "\n")
-        
-        metrics = create_timeout_metrics(num_inputs=20)
-        timeout_occurred = True
-    
-    except Exception as e:
-        print("\n" + "=" * 80)
-        print("❌ ERROR OCCURRED")
-        print("=" * 80)
-        print(f"Error: {e}")
-        print("\nUsing timeout metrics to indicate failure...")
-        print("=" * 80 + "\n")
-        
-        metrics = create_timeout_metrics(num_inputs=20)
-        timeout_occurred = True
-    
-    if metrics:
-        # Print detailed analysis (unless timeout occurred)
-        if not timeout_occurred:
-            print_privacy_vs_latency_analysis(metrics)
-        else:
-            print("\n[Timeout Analysis]")
-            print(f"Average latency: {metrics['he_avg']:.0f} ms (vs {metrics['plaintext_avg']:.2f} ms plaintext)")
-            print(f"Slowdown factor: {metrics['he_avg']/metrics['plaintext_avg']:.0f}x")
-            print(f"Timeout message: {metrics.get('timeout_message', 'N/A')}\n")
-        
-        # Save to CSV
-        save_metrics_to_csv(metrics, "strategy3_results.csv")
-        
-        # Summary metrics
-        print("\nFINAL SUMMARY:")
-        print("-" * 80)
-        print(f"✓ Plaintext latency:     {metrics['plaintext_avg']:.2f} ms")
-        print(f"✓ HE latency:            {metrics['he_avg']:.2f} ms")
-        print(f"✓ Slowdown:              {metrics['he_avg']/metrics['plaintext_avg']:.1f}x")
-        print(f"✓ Top-5 accuracy:        {metrics['accuracy_pct']:.1f}%")
-        print(f"✓ Cosine similarity:     {metrics['cosine_similarity_avg']:.6f}")
-        if timeout_occurred:
-            print(f"⚠️  Status:               TIMEOUT/FAILED")
-            print(f"   (Results show FHE significantly worse than SHE)")
-        print(f"✓ Results saved to:      strategy3_results.csv & strategy3_results_summary.csv")
-        print("-" * 80 + "\n")
-
+    main()

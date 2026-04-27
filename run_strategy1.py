@@ -691,6 +691,15 @@ def main() -> None:
     print_quality_summary(results)
     print_analysis_summary(results, args.layers, args.seq, args.wscale)
 
+    # Save results for comparison with other strategies
+    try:
+        import pickle
+        with open(".strategy1_results.pkl", "wb") as f:
+            pickle.dump(results, f)
+        print("  ✓ Results saved to .strategy1_results.pkl")
+    except Exception:
+        pass
+
     print("\n  ✓ Strategy 1 evaluation complete.\n")
 
 
