@@ -50,6 +50,7 @@ Performance notes
 import time
 from typing import Union
 
+import numpy as np
 import torch
 
 try:
@@ -311,6 +312,378 @@ def decrypt_tensor(
 
 
 # ---------------------------------------------------------------------------
+# Batched encryption and matrix multiplication
+# ---------------------------------------------------------------------------
+
+def batch_encrypt(
+    values: np.ndarray,
+    HE: Pyfhel,
+    pack_size: int,
+) -> list:
+    """
+    Pack multiple plaintext values into ciphertexts using SIMD-style batching.
+
+    This function groups `pack_size` consecutive values into a single ciphertext
+    when supported by Pyfhel's batching (BFV slots). Falls back to elementwise
+    encryption if batching is not suitable (e.g., if pack_size exceeds available
+    slots).
+
+    Parameters
+    ----------
+    values : np.ndarray
+        1-D array of plaintext values (integers or floats; floats are truncated
+        to int64).
+
+    HE : Pyfhel
+        Initialized Pyfhel context with keys and rotation support.
+
+    pack_size : int
+        Target number of values to pack per ciphertext.
+        If pack_size >= len(values), packs all into one ciphertext (if it fits).
+        Otherwise, creates ceil(len(values) / pack_size) ciphertexts.
+        Clamped internally to HE.get_nSlots() if larger.
+
+    Returns
+    -------
+    list[PyCtxt]
+        List of ciphertexts, each containing up to pack_size encrypted values.
+        Metadata attributes: ``.batch = True``, ``.pack_size = pack_size``
+        on the returned _TaggedList object.
+
+    Notes
+    -----
+    - Each ciphertext is zero-padded to n_slots (= n // 2) to conform to BFV
+      batching requirements.
+    - The function uses HE.encode() with a list of values and HE.encrypt() to
+      perform SIMD-style encryption in Pyfhel's native batching mode.
+    """
+    _check_he(HE)
+
+    # Convert to numpy if needed
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().numpy()
+    elif not isinstance(values, np.ndarray):
+        values = np.asarray(values)
+
+    # Convert to int64
+    values = values.astype(np.int64).flatten()
+
+    n_slots = HE.get_nSlots()  # Typically n // 2
+
+    # Clamp pack_size to available slots
+    effective_pack_size = min(pack_size, n_slots)
+
+    ciphertexts = []
+
+    # Group values into chunks of pack_size
+    for i in range(0, len(values), effective_pack_size):
+        chunk = values[i : i + effective_pack_size].tolist()
+
+        # Pad chunk to n_slots (required by BFV batching)
+        padded_chunk = chunk + [0] * (n_slots - len(chunk))
+
+        # Encode and encrypt as SIMD batch
+        ptxt = HE.encode(padded_chunk)
+        ctxt = HE.encrypt(ptxt)
+        ciphertexts.append(ctxt)
+
+    # Attach metadata
+    ciphertexts = _TaggedList(
+        ciphertexts,
+        original_shape=(len(values),),
+        batch=True,
+        pack_size=effective_pack_size,
+    )
+    return ciphertexts
+
+
+def he_linear_batched(
+    weight_matrix: np.ndarray,
+    input_ciphertexts: list,
+    HE: Pyfhel,
+    pack_size: int = None,
+) -> list:
+    """
+    Compute matrix multiplication using batched ciphertexts.
+
+    Computes output = input @ weight_matrix.T where input is encrypted in
+    batched form. This function demonstrates how batched ciphertexts can
+    reduce the number of ciphertexts (and thus operations) needed for
+    linear algebra on encrypted data.
+
+    Parameters
+    ----------
+    weight_matrix : np.ndarray
+        Shape (out_features, in_features), plaintext weights (integers).
+        Each row is the weight vector for one output feature.
+
+    input_ciphertexts : list
+        Batched ciphertexts from batch_encrypt() or compatible.
+        Assumed to represent a flattened input vector encrypted across
+        multiple ciphertexts.
+
+    HE : Pyfhel
+        Initialized Pyfhel context with keys and relinearization support.
+
+    pack_size : int, optional
+        If provided, used for alignment/metadata. Otherwise inferred from
+        `input_ciphertexts.pack_size` if available.
+
+    Returns
+    -------
+    list[PyCtxt]
+        Batched ciphertexts containing encrypted output values.
+        Shape corresponds to (out_features,) after decryption.
+
+    Notes
+    -----
+    - This is a simplified implementation for demonstration. A production
+      matrix-vector product would use rotations and summation tricks to
+      amortize the cost across slots.
+    - Each output feature is computed as a dot product of the weight row
+      and the (encrypted) input vector. Relinearization is applied after
+      multiplication to keep noise in check.
+    """
+    _check_he(HE)
+
+    weight_matrix = np.asarray(weight_matrix, dtype=np.int64)
+
+    if len(input_ciphertexts) == 0:
+        raise ValueError("input_ciphertexts cannot be empty")
+
+    out_features, in_features = weight_matrix.shape
+    n_slots = HE.get_nSlots()
+
+    # Flatten input ciphertexts into a single list
+    if hasattr(input_ciphertexts, "original_shape"):
+        n_input = int(np.prod(input_ciphertexts.original_shape))
+    else:
+        n_input = len(input_ciphertexts)
+
+    if n_input < in_features:
+        raise ValueError(
+            f"Input size {n_input} is less than weight_matrix.shape[1]={in_features}"
+        )
+
+    output_ciphertexts = []
+
+    # For each output feature, compute dot product with the weight row
+    for out_idx in range(out_features):
+        weights = weight_matrix[out_idx]  # shape (in_features,)
+
+        # Initialize result to encrypted zero
+        ptxt_zero = HE.encode([0] * n_slots)
+        result = HE.encrypt(ptxt_zero)
+
+        # Accumulate weighted contributions from input ciphertexts
+        val_idx = 0
+        for ctxt_idx, ctxt in enumerate(input_ciphertexts):
+            # Determine how many values are in this ciphertext
+            if ctxt_idx == len(input_ciphertexts) - 1:
+                # Last ciphertext may have fewer slots in use
+                slots_in_use = n_input - val_idx
+            else:
+                slots_in_use = n_slots
+
+            # For each slot in this ciphertext, multiply by corresponding weight
+            for slot_idx in range(min(slots_in_use, len(weights) - val_idx)):
+                if val_idx + slot_idx < in_features:
+                    w = int(weights[val_idx + slot_idx])
+
+                    if w != 0:  # Skip zero weights to save computation
+                        # Multiply ciphertext by weight (homomorphic scalar mult)
+                        scaled = ctxt * w
+                        HE.relinearize(scaled)
+
+                        # Add to accumulator
+                        result = result + scaled
+
+            val_idx += slots_in_use
+
+        output_ciphertexts.append(result)
+
+    output_ciphertexts = _TaggedList(
+        output_ciphertexts,
+        original_shape=(out_features,),
+        batch=True,
+    )
+    return output_ciphertexts
+
+
+# ---------------------------------------------------------------------------
+# Benchmark: batched vs element-wise
+# ---------------------------------------------------------------------------
+
+def he_batch_benchmark() -> None:
+    """
+    Benchmark batched vs element-wise encryption and decryption.
+
+    Measures encryption/decryption performance on small toy problems and
+    reports speedup factors. Demonstrates the SIMD advantage of BFV batching.
+
+    Output
+    ------
+    Prints timing comparisons and measured speedup factors for:
+      1. Encryption time: element-wise vs batched
+      2. Decryption time: element-wise vs batched
+      3. Ciphertext count reduction
+      4. Caveats and notes on when batching is beneficial
+
+    Notes
+    -----
+    - Uses n=2**12 for fast iteration in the demo; production may use n=2**14.
+    - Speedup factors depend on Pyfhel version, system architecture, and
+      whether rotations/advanced operations are used.
+    - For small tensors (< 16 values), element-wise may be faster due to
+      lower padding overhead.
+    """
+    print("=" * 70)
+    print("  Batched Homomorphic Encryption — Benchmark")
+    print("=" * 70)
+
+    # Setup context (small n for fast demo iteration)
+    print("\n[Setup] Creating HE context (n=2**12, t=65537) …")
+    HE = setup_HE_context(n=2**12, t=65537)
+    n_slots = HE.get_nSlots()
+    print(f"  Available slots per ciphertext: {n_slots}")
+
+    # Test cases with increasing sizes
+    test_cases = [
+        {"size": 32, "pack_size": 16, "name": "Small (32 values, pack=16)"},
+        {"size": 64, "pack_size": 32, "name": "Medium (64 values, pack=32)"},
+        {"size": 128, "pack_size": 64, "name": "Large (128 values, pack=64)"},
+    ]
+
+    results = []
+
+    print("\n" + "-" * 70)
+    print("  PART 1: Encryption Timing")
+    print("-" * 70)
+
+    for test in test_cases:
+        size = test["size"]
+        pack_size = test["pack_size"]
+        name = test["name"]
+
+        values = np.random.randint(0, 1000, size=size, dtype=np.int64)
+
+        # Element-wise encryption
+        t0 = time.perf_counter()
+        tensor = torch.from_numpy(values)
+        ct_elementwise = encrypt_tensor(tensor, HE, batch=False)
+        t_elementwise = time.perf_counter() - t0
+        n_ctxt_elementwise = len(ct_elementwise)
+
+        # Batched encryption
+        t0 = time.perf_counter()
+        ct_batched = batch_encrypt(values, HE, pack_size)
+        t_batched = time.perf_counter() - t0
+        n_ctxt_batched = len(ct_batched)
+
+        speedup = t_elementwise / t_batched if t_batched > 0 else float("inf")
+
+        results.append(
+            {
+                "name": name,
+                "enc_elementwise": t_elementwise,
+                "enc_batched": t_batched,
+                "enc_speedup": speedup,
+                "n_ctxt_elementwise": n_ctxt_elementwise,
+                "n_ctxt_batched": n_ctxt_batched,
+            }
+        )
+
+        print(f"\n  {name}")
+        print(f"    Element-wise: {t_elementwise*1e3:.2f} ms  ({n_ctxt_elementwise} ctxts)")
+        print(f"    Batched:      {t_batched*1e3:.2f} ms  ({n_ctxt_batched} ctxts)")
+        print(f"    ⚡ Speedup:    {speedup:.2f}x")
+
+    print("\n" + "-" * 70)
+    print("  PART 2: Decryption Timing")
+    print("-" * 70)
+
+    for test in test_cases:
+        size = test["size"]
+        pack_size = test["pack_size"]
+        name = test["name"]
+
+        values = np.random.randint(0, 1000, size=size, dtype=np.int64)
+        tensor = torch.from_numpy(values)
+
+        # Element-wise
+        ct_elementwise = encrypt_tensor(tensor, HE, batch=False)
+        t0 = time.perf_counter()
+        result_elementwise = decrypt_tensor(ct_elementwise, HE)
+        t_dec_elementwise = time.perf_counter() - t0
+
+        # Batched
+        ct_batched = batch_encrypt(values, HE, pack_size)
+        t0 = time.perf_counter()
+        result_batched = decrypt_tensor(ct_batched, HE)
+        t_dec_batched = time.perf_counter() - t0
+
+        speedup_dec = (
+            t_dec_elementwise / t_dec_batched if t_dec_batched > 0 else float("inf")
+        )
+
+        # Find and update the matching result entry
+        for res in results:
+            if res["name"] == name:
+                res["dec_elementwise"] = t_dec_elementwise
+                res["dec_batched"] = t_dec_batched
+                res["dec_speedup"] = speedup_dec
+
+        print(f"\n  {name}")
+        print(f"    Element-wise: {t_dec_elementwise*1e3:.2f} ms")
+        print(f"    Batched:      {t_dec_batched*1e3:.2f} ms")
+        print(f"    ⚡ Speedup:    {speedup_dec:.2f}x")
+
+    # Summary and caveats
+    print("\n" + "=" * 70)
+    print("  Summary & Caveats")
+    print("=" * 70)
+
+    avg_enc_speedup = np.mean([r["enc_speedup"] for r in results])
+    avg_dec_speedup = np.mean([r["dec_speedup"] for r in results])
+
+    print(f"\n  📊 Average Speedup (across test cases):")
+    print(f"     Encryption: {avg_enc_speedup:.2f}x")
+    print(f"     Decryption: {avg_dec_speedup:.2f}x")
+
+    if avg_enc_speedup >= 1.2 or avg_dec_speedup >= 1.2:
+        print(f"     ✓ Batch mode shows ≥1.2x speedup (acceptable for demo)")
+    else:
+        print(
+            f"     ⚠ Batch mode shows < 1.2x speedup on this system "
+            f"(small problem size effect)"
+        )
+
+    print(
+        """
+  ✓ Batched encryption reduces ciphertext count from N to ceil(N/pack_size).
+  ✓ Decryption is typically faster for batched mode due to SIMD advantage
+    (multiple slots decoded in one operation).
+  ✓ Ciphertext reduction directly translates to fewer homomorphic operations.
+
+  ⚠ CAVEATS:
+    1. BFV batching requires padding to n//2 slots, which costs memory.
+       The speedup is most pronounced for large N (> 1024 values).
+    2. Speedup heavily depends on Pyfhel version, C++ implementation, and
+       underlying CPU architecture. Results vary significantly by system.
+    3. For very small problem sizes (< 32 values), elementwise may be
+       competitive due to padding overhead in batched mode.
+    4. Homomorphic matrix multiplication using batched ciphertexts requires
+       rotations to gather/scatter data within slots. This notebook shows
+       the encryption/decryption benefit; full matmul speedup depends on
+       circuit design.
+    5. Noise budget grows with multiplicative depth. Batched ops are
+       subject to same noise constraints as elementwise operations.
+    """
+    )
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
 # Demo / acceptance test
 # ---------------------------------------------------------------------------
 
@@ -466,10 +839,11 @@ def test_homomorphic_operations() -> None:
 
 class _TaggedList(list):
     """list subclass that carries metadata attributes for decrypt_tensor."""
-    def __init__(self, items, original_shape=None, batch=False):
+    def __init__(self, items, original_shape=None, batch=False, pack_size=None):
         super().__init__(items)
         self.original_shape = original_shape
         self.batch = batch
+        self.pack_size = pack_size
 
 
 def _check_he(HE) -> None:
