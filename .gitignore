@@ -84,7 +84,9 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
-*.pkl
+.strategy1_results.pkl
+.strategy2_results.pkl
+.strategy3_results.pkl
 
 # =====================
 # mypy / type checking
