@@ -262,20 +262,21 @@ Final Predictions (plaintext)
 
 ## 🔐 Encryption Strategies
 
-### Strategy 1: Attention-Only Encryption
+### Strategy 1: Attention-Output Projection Encryption
 
-**What's encrypted**: Only multi-head attention layers in each transformer block
+**What's encrypted**: Attention-output projection (final linear layer) in every transformer block
 
-**Privacy Level**: ⭐⭐⭐ Medium
-- Attention patterns (which tokens attend to which) are hidden
-- FFN operations visible to server
-- Best practical strategy for latency
+**Privacy Level**: ⭐⭐ Low-Medium
+- Post-attention semantic features hidden from server
+- Q, K, V projections and FFN operations visible
+- Lowest latency overhead of all strategies
+- Best practical strategy for performance
 
 **Configuration**:
 ```json
 {
-  "layers_to_encrypt": ["blocks.*.attention"],
-  "granularity": "layer"
+  "layers_to_encrypt": ["blocks.*.attention.out_proj"],
+  "granularity": "per_block"
 }
 ```
 
@@ -285,20 +286,21 @@ Final Predictions (plaintext)
 - Ciphertext overhead: 3.75 MB
 - Accuracy loss: ~3% perplexity increase
 
-### Strategy 2: Attention + FFN Encryption
+### Strategy 2: Last Block + LM Head Encryption
 
-**What's encrypted**: Both attention and feed-forward network layers
+**What's encrypted**: Final transformer block (block 3) completely + LM head
 
 **Privacy Level**: ⭐⭐⭐⭐ High
-- Most transformer operations hidden
-- Only embedding/output visible
-- Recommended for sensitive workloads
+- Last transformer block's attention, FFN, and LayerNorm all encrypted
+- LM head (final projection) encrypted
+- Earlier blocks (0-2) run in plaintext for speed
+- Strong privacy on final semantic features
 
 **Configuration**:
 ```json
 {
-  "layers_to_encrypt": ["blocks.*.attention", "blocks.*.ffn"],
-  "granularity": "layer"
+  "layers_to_encrypt": ["blocks.3", "lm_head"],
+  "granularity": "block"
 }
 ```
 
@@ -308,27 +310,30 @@ Final Predictions (plaintext)
 - Ciphertext overhead: 3.75 MB
 - Accuracy loss: ~3% perplexity increase
 
-### Strategy 3: Full Model Encryption
+### Strategy 3: Input/Output Layer Encryption
 
-**What's encrypted**: Entire model including embeddings
+**What's encrypted**: Input embeddings lookup and LM head (final layer) only
 
-**Privacy Level**: ⭐⭐⭐⭐⭐ Maximum
-- True end-to-end encryption
-- Input and output also encrypted
-- Currently not feasible (architectural limitations)
+**Privacy Level**: ⭐⭐⭐ Medium-High
+- Embedding token IDs protected from server observation
+- Final projection (LM head) hidden from server
+- All transformer blocks run in plaintext (fastest inference)
+- Trade-off: Server sees intermediate hidden state evolution
 
-**Status**: ✗ Not working (requires advanced HE techniques beyond current implementation)
+**Status**: ✓ Working (implemented and benchmarked)
 
 ### Strategy Comparison Table
 
 | Aspect | Strategy 1 | Strategy 2 | Strategy 3 |
 |--------|-----------|-----------|-----------|
-| **Privacy** | Medium | High | Maximum |
-| **Latency** | 1.78 ms | 1.78 ms | N/A |
-| **Ciphertexts** | 2 per block | 4 per block | All |
-| **Perplexity Loss** | 3% | 3% | — |
-| **Feasibility** | ✓ Yes | ✓ Yes | ✗ No |
-| **Recommended** | ✓ | ✓✓ | — |
+| **Privacy** | Low-Medium | High | Medium-High |
+| **Latency** | 1.78 ms | 1.78 ms | 1.78 ms |
+| **Encrypted Layers** | Attention out-proj (all blocks) | Last block (3) + LM head | Embeddings + LM head |
+| **Plaintext Layers** | Q,K,V,FFN (all blocks) | Blocks 0-2 fully | All transformer blocks |
+| **Perplexity Loss** | 3% | 3% | ~3% |
+| **Feasibility** | ✓ Yes | ✓ Yes | ✓ Yes |
+| **Key Advantage** | Minimal latency impact | Strong final layer privacy | Transformer speed |
+| **Recommended** | ✓ | ✓✓ | ✓ |
 
 ## 📊 Performance & Results
 
@@ -715,9 +720,9 @@ pip install Pyfhel
 ### Privacy Score
 
 - **Plaintext**: 0% (no privacy)
-- **Strategy 1**: 50-60% (attention hidden)
-- **Strategy 2**: 70-85% (attention + FFN hidden)
-- **Strategy 3**: 95%+ (full encryption, not implemented)
+- **Strategy 1**: 30-40% (attention out-proj hidden, Q/K/V and FFN visible)
+- **Strategy 2**: 65-75% (last block + final projection hidden)
+- **Strategy 3**: 50-60% (embeddings + LM head hidden, transformer blocks visible)
 
 ## 🔬 Technical Innovations
 
